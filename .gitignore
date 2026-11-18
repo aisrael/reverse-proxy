@@ -27,3 +27,6 @@ target/
 
 # Environment variables
 .envrc
+
+# Local development certificates and keys
+dev-certs/
