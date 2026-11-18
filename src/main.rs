@@ -1,9 +1,11 @@
+mod errors;
 mod proxy;
 mod server;
 
 use bytes::Bytes;
 use clap::Parser;
 use clap::Subcommand;
+use errors::Error;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::Request;
@@ -11,7 +13,6 @@ use hyper::Response;
 use hyper::StatusCode;
 use hyper::body::Incoming;
 use std::convert::Infallible;
-use std::io;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +44,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
     // Log level comes from `RUST_LOG` (for example `RUST_LOG=debug`). Default is `info`.
