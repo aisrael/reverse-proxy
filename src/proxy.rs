@@ -110,17 +110,31 @@ fn spawn_connection(
 /// `client_ip` is the IP address of the client.
 ///
 /// Prepare the request, then forward it.
+///
+/// Every request has a request ID. The upstream gets it in the request, and the
+/// client gets it in the response. Use the `X-Request-Id` of the client if it
+/// is valid. Otherwise make a new one.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     state: Arc<AppState>,
     client_ip: IpAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
-    if let Err(err) = prepare_request(&mut request, &state.upstream, client_ip) {
-        warn!(%err, "cannot make the upstream URI");
-        return Ok(bad_gateway());
-    }
-    Ok(forward(&state, request).await)
+    let prepared = prepare_request(&mut request, &state.upstream, client_ip);
+    // Do this after `prepare_request`. A `Connection` header from the client
+    // can name `X-Request-Id`, and then `prepare_request` removes it.
+    let request_id = headers::ensure_request_id(request.headers_mut());
+    let mut response = match prepared {
+        Ok(()) => forward(&state, request).await,
+        Err(err) => {
+            warn!(%err, "cannot make the upstream URI");
+            bad_gateway()
+        }
+    };
+    response
+        .headers_mut()
+        .insert(headers::REQUEST_ID, request_id);
+    Ok(response)
 }
 
 /// Change `request` so that it is ready for the upstream at `upstream`
