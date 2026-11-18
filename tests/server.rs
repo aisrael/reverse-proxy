@@ -52,6 +52,7 @@ impl Server {
             std::env::temp_dir().join(format!("reverse-proxy-{}.stderr", std::process::id()));
         let stderr = File::create(&stderr_path).expect("failed to create the STDERR file");
         let child = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
+            .arg("server")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()

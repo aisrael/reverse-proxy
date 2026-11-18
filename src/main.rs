@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use clap::Parser;
+use clap::Subcommand;
 use http_body_util::Full;
 use hyper::Request;
 use hyper::Response;
@@ -9,6 +11,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -20,14 +23,31 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-/// Address of the server. It is fixed for now.
+/// Address of the `server` mode. It is fixed for now.
 const LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A reverse proxy, and a small web server to test it with.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// The mode to run.
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run a web server that answers every request with `200 OK`.
+    Server,
+}
+
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> io::Result<()> {
+    let cli = Cli::parse();
+
     // Log level comes from `RUST_LOG` (for example `RUST_LOG=debug`). Default is `info`.
     // Never log secrets.
     tracing_subscriber::fmt()
@@ -36,6 +56,13 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
+    match cli.command {
+        Command::Server => run_server().await,
+    }
+}
+
+/// Run the web server until Ctrl+C arrives, then shut down gracefully.
+async fn run_server() -> io::Result<()> {
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     info!(addr = %listener.local_addr()?, "listening");
 
