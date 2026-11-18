@@ -211,8 +211,22 @@ async fn connect(connector: &TlsConnector) -> TlsStream<tokio::net::TcpStream> {
         .expect("the TLS handshake failed")
 }
 
-/// Send a request to the proxy. Return the status, the headers and the body.
+/// Send a request to the proxy with a valid `x-api-key`. Return the status,
+/// the headers and the body.
 async fn send(
+    client: &TestClient,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: impl Into<Bytes>,
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut all = vec![("x-api-key", "test")];
+    all.extend_from_slice(headers);
+    send_raw(client, method, path, &all, body).await
+}
+
+/// Send a request to the proxy with exactly the given headers.
+async fn send_raw(
     client: &TestClient,
     method: Method,
     path: &str,
@@ -476,6 +490,22 @@ async fn returns_502_when_the_upstream_is_down() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(&body[..], b"Bad Gateway");
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_request_without_an_api_key_before_it_reaches_the_upstream() {
+    // No upstream runs. A 502 would mean that the proxy tried to connect.
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = client();
+
+    let (status, headers, body) = send_raw(&client, Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(&body[..], br#"{"message": "Unauthorized"}"#);
+
+    let (status, _, _) = send_raw(&client, Method::GET, "/", &[("x-api-key", "")], "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

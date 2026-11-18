@@ -2,6 +2,7 @@
 //!
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
+use crate::admission;
 use crate::headers;
 use crate::state::AppState;
 use bytes::Bytes;
@@ -14,6 +15,7 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
 use hyper::body::Body as RequestBody;
+use hyper::header::CONTENT_TYPE;
 use hyper::header::HOST;
 use hyper::header::HeaderValue;
 use hyper::http::uri::InvalidUri;
@@ -158,15 +160,20 @@ where
     // Keep the method and the path for the log line. Never log the query.
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let admitted = admission::admit(request.headers());
     let prepared = prepare_request(&mut request, &state.upstream, client_ip);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
     let request_id = headers::ensure_request_id(request.headers_mut());
-    let mut response = match prepared {
-        Ok(()) => forward(&state, request).await,
-        Err(err) => {
-            warn!(%err, "cannot make the upstream URI");
-            bad_gateway()
+    let mut response = if !admitted {
+        unauthorized()
+    } else {
+        match prepared {
+            Ok(()) => forward(&state, request).await,
+            Err(err) => {
+                warn!(%err, "cannot make the upstream URI");
+                bad_gateway()
+            }
         }
     };
     debug!(
@@ -255,6 +262,20 @@ where
     }
 }
 
+/// The answer for a request that admission rejects. The proxy does not
+/// connect to the upstream.
+fn unauthorized() -> Response<Body> {
+    let body = Full::new(Bytes::from_static(br#"{"message": "Unauthorized"}"#))
+        .map_err(|never| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
 /// The answer for a failure between the proxy and the upstream.
 /// The body has no detail. The detail is in the log.
 fn bad_gateway() -> Response<Body> {
@@ -274,7 +295,14 @@ mod tests {
     /// `handle` then returns at once. It makes no connection and opens no socket.
     const BAD_UPSTREAM: &str = "not a valid address";
 
+    /// Call `handle` with a valid `x-api-key` and the given headers.
     async fn call(headers: &[(&str, &str)]) -> Response<Body> {
+        let mut all = vec![("x-api-key", "test")];
+        all.extend_from_slice(headers);
+        call_raw(&all).await
+    }
+
+    async fn call_raw(headers: &[(&str, &str)]) -> Response<Body> {
         let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM));
         let mut request = Request::builder().uri("/path?x=1");
         for (name, value) in headers {
@@ -295,6 +323,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"Bad Gateway");
+    }
+
+    #[tokio::test]
+    async fn handle_returns_401_without_an_api_key() {
+        let response = call_raw(&[]).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["x-request-id"].len(), 36);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], br#"{"message": "Unauthorized"}"#);
+    }
+
+    #[tokio::test]
+    async fn handle_returns_401_with_an_empty_api_key() {
+        let response = call_raw(&[("x-api-key", "")]).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
