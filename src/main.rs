@@ -1,3 +1,5 @@
+mod serve;
+
 use bytes::Bytes;
 use clap::Parser;
 use clap::Subcommand;
@@ -5,29 +7,18 @@ use http_body_util::Full;
 use hyper::Request;
 use hyper::Response;
 use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioExecutor;
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder;
-use hyper_util::server::graceful::GracefulShutdown;
+use serve::serve;
 use std::convert::Infallible;
 use std::io;
-use std::net::SocketAddr;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 /// Address of the `server` mode. It is fixed for now.
 const LISTEN_ADDR: &str = "127.0.0.1:9000";
-
-/// Maximum time to wait for open connections to finish after a shutdown request.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A reverse proxy, and a small web server to test it with.
 #[derive(Parser)]
@@ -86,63 +77,6 @@ async fn run_server() -> io::Result<()> {
 
     info!("shut down cleanly");
     Ok(())
-}
-
-/// Accept connections on `listener` until `shutdown` is cancelled.
-///
-/// After that, stop accepting and wait for open connections to finish.
-/// Stop waiting after `SHUTDOWN_TIMEOUT`.
-async fn serve(listener: TcpListener, shutdown: CancellationToken) {
-    let builder = Builder::new(TokioExecutor::new());
-    let graceful = GracefulShutdown::new();
-
-    loop {
-        let (stream, peer) = tokio::select! {
-            _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(err) => {
-                    warn!(%err, "failed to accept a connection");
-                    continue;
-                }
-            },
-        };
-        debug!(%peer, "connection accepted");
-        spawn_connection(&builder, &graceful, stream, peer);
-    }
-
-    // Stop accepting. Close the listening socket before the wait.
-    drop(listener);
-    info!("waiting for open connections to finish");
-    if timeout(SHUTDOWN_TIMEOUT, graceful.shutdown())
-        .await
-        .is_err()
-    {
-        warn!(
-            timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-            "timeout: some connections are still open"
-        );
-    }
-}
-
-/// Serve one connection in its own task. HTTP/1 and HTTP/2 are both supported.
-fn spawn_connection(
-    builder: &Builder<TokioExecutor>,
-    graceful: &GracefulShutdown,
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-) {
-    let builder = builder.clone();
-    let watcher = graceful.watcher();
-    tokio::spawn(async move {
-        // The connection borrows `builder`, so create it inside the task.
-        let connection = builder.serve_connection(TokioIo::new(stream), service_fn(handle));
-        // `watch` tells the connection to finish its work when the shutdown starts.
-        if let Err(err) = watcher.watch(connection).await {
-            debug!(%peer, %err, "connection error");
-        }
-        debug!(%peer, "connection closed");
-    });
 }
 
 /// Return `200 OK` with a fixed body for every request.
