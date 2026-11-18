@@ -17,6 +17,7 @@ use hyper::Version;
 use hyper::body::Incoming;
 use hyper::header::HOST;
 use hyper::header::HeaderValue;
+use hyper::http::uri::InvalidUri;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
@@ -108,20 +109,38 @@ fn spawn_connection(
 /// Send `request` to the upstream of `state` and return the response.
 /// `client_ip` is the IP address of the client.
 ///
-/// Keep the method, the path and the query. Stream both bodies. Change the
-/// headers as a proxy must:
-///
-/// - Remove the hop-by-hop headers from the request and from the response.
-/// - Replace the forwarding headers of the request (`X-Forwarded-*`, `Via`).
-/// - Set `Host` of the request to the address of the upstream.
-///
-/// Keep the other headers.
+/// Prepare the request, then forward it.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     state: Arc<AppState>,
     client_ip: IpAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
+    if let Err(err) = prepare_request(&mut request, &state.upstream, client_ip) {
+        warn!(%err, "cannot make the upstream URI");
+        return Ok(bad_gateway());
+    }
+    Ok(forward(&state, request).await)
+}
+
+/// Change `request` so that it is ready for the upstream at `upstream`
+/// (a `host:port` address). `client_ip` is the IP address of the client.
+///
+/// Keep the method, the path, the query and the body. Change the rest as a
+/// proxy must:
+///
+/// - Send the request to the upstream, as HTTP/1.
+/// - Remove the hop-by-hop headers.
+/// - Replace the forwarding headers (`X-Forwarded-*`, `Via`).
+/// - Set `Host` to the address of the upstream.
+///
+/// Keep the other headers.
+/// Return an error if the URI for the upstream is not valid.
+fn prepare_request<B>(
+    request: &mut Request<B>,
+    upstream: &str,
+    client_ip: IpAddr,
+) -> Result<(), InvalidUri> {
     // The host that the client asked for. An HTTP/2 request has no `Host`
     // header, but its URI has the authority.
     let original_host = request.headers().get(HOST).cloned().or_else(|| {
@@ -136,13 +155,7 @@ async fn handle(
         .uri()
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
-    let uri = match format!("http://{}{path_and_query}", state.upstream).parse::<Uri>() {
-        Ok(uri) => uri,
-        Err(err) => {
-            warn!(%err, "cannot make the upstream URI");
-            return Ok(bad_gateway());
-        }
-    };
+    let uri = format!("http://{upstream}{path_and_query}").parse::<Uri>()?;
     *request.uri_mut() = uri;
     // The connection to the upstream is HTTP/1, also when the client uses HTTP/2.
     *request.version_mut() = Version::HTTP_11;
@@ -155,17 +168,23 @@ async fn handle(
         "http",
         client_version,
     );
-    headers::set_host(request_headers, &state.upstream);
+    headers::set_host(request_headers, upstream);
+    Ok(())
+}
 
+/// Send the prepared `request` to the upstream and return the response, with
+/// the hop-by-hop headers removed. Stream the body of the response.
+/// If the upstream fails, return `502 Bad Gateway`.
+async fn forward(state: &AppState, request: Request<Incoming>) -> Response<Body> {
     match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             headers::remove_hop_by_hop(&mut parts.headers);
-            Ok(Response::from_parts(parts, body.boxed_unsync()))
+            Response::from_parts(parts, body.boxed_unsync())
         }
         Err(err) => {
             warn!(%err, "request to the upstream failed");
-            Ok(bad_gateway())
+            bad_gateway()
         }
     }
 }
