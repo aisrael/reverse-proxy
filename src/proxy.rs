@@ -4,6 +4,7 @@
 
 use crate::SERVER_ADDR;
 use crate::headers;
+use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -17,8 +18,6 @@ use hyper::body::Incoming;
 use hyper::header::HOST;
 use hyper::header::HeaderValue;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
@@ -39,9 +38,6 @@ use tracing::warn;
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The client that sends requests to the upstream.
-type UpstreamClient = Client<HttpConnector, Incoming>;
-
 /// The type of every response body. The answer from the upstream and our own
 /// error answer have different body types, so both are boxed.
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
@@ -51,11 +47,9 @@ type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
 pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
-    // One client for all requests. It keeps connections to the upstream open.
-    let client: UpstreamClient = Client::builder(TokioExecutor::new()).build_http();
-    // The upstream is the `server` mode. The connection uses plain HTTP.
-    let upstream: Arc<str> = SERVER_ADDR.as_str().into();
-    info!(%upstream, "sending requests to the upstream");
+    // The upstream is the `server` mode.
+    let state = Arc::new(AppState::new(SERVER_ADDR.as_str()));
+    info!(upstream = %state.upstream, "sending requests to the upstream");
     let builder = Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
 
@@ -71,14 +65,7 @@ pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
             },
         };
         debug!(%peer, "connection accepted");
-        spawn_connection(
-            &builder,
-            &graceful,
-            stream,
-            peer,
-            client.clone(),
-            upstream.clone(),
-        );
+        spawn_connection(&builder, &graceful, stream, peer, state.clone());
     }
 
     // Stop accepting. Close the listening socket before the wait.
@@ -101,15 +88,13 @@ fn spawn_connection(
     graceful: &GracefulShutdown,
     stream: TcpStream,
     peer: SocketAddr,
-    client: UpstreamClient,
-    upstream: Arc<str>,
+    state: Arc<AppState>,
 ) {
     let builder = builder.clone();
     let watcher = graceful.watcher();
     tokio::spawn(async move {
         let client_ip = peer.ip();
-        let service =
-            service_fn(move |request| handle(client.clone(), upstream.clone(), client_ip, request));
+        let service = service_fn(move |request| handle(state.clone(), client_ip, request));
         // The connection borrows `builder`, so create it inside the task.
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
@@ -120,7 +105,7 @@ fn spawn_connection(
     });
 }
 
-/// Send `request` to `upstream` (a `host:port` address) and return the response.
+/// Send `request` to the upstream of `state` and return the response.
 /// `client_ip` is the IP address of the client.
 ///
 /// Keep the method, the path and the query. Stream both bodies. Change the
@@ -133,8 +118,7 @@ fn spawn_connection(
 /// Keep the other headers.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
-    client: UpstreamClient,
-    upstream: Arc<str>,
+    state: Arc<AppState>,
     client_ip: IpAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
@@ -152,7 +136,7 @@ async fn handle(
         .uri()
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
-    let uri = match format!("http://{upstream}{path_and_query}").parse::<Uri>() {
+    let uri = match format!("http://{}{path_and_query}", state.upstream).parse::<Uri>() {
         Ok(uri) => uri,
         Err(err) => {
             warn!(%err, "cannot make the upstream URI");
@@ -171,9 +155,9 @@ async fn handle(
         "http",
         client_version,
     );
-    headers::set_host(request_headers, &upstream);
+    headers::set_host(request_headers, &state.upstream);
 
-    match client.request(request).await {
+    match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             headers::remove_hop_by_hop(&mut parts.headers);
