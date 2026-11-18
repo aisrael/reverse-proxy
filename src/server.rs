@@ -1,3 +1,4 @@
+use crate::headers::REQUEST_ID;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -83,21 +84,43 @@ fn spawn_connection(
     });
 }
 
-/// Answer a request.
+/// Answer a request and write one `INFO` log line for it: the method, the path
+/// (never the query), the `X-Request-Id` if the request has one, and the status.
+/// Never log other headers or the body.
+async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let response = answer(request).await;
+    info!(
+        %method,
+        %path,
+        request_id = request_id.as_deref(),
+        status = response.status().as_u16(),
+        "request"
+    );
+    Ok(response)
+}
+
+/// Make the answer for a request.
 ///
 /// - `/echo`: send back the request headers and the request body.
 /// - `/status/{code}`: answer with that status code and an empty body. A `503`
 ///   also has the header `Retry-After: 1`.
 /// - Any other path: `200 OK` with the body `ok`.
-async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn answer(request: Request<Incoming>) -> Response<Full<Bytes>> {
     let path = request.uri().path();
     if path == "/echo" {
-        return Ok(echo(request).await);
+        return echo(request).await;
     }
     if let Some(code) = path.strip_prefix("/status/") {
-        return Ok(status(code));
+        return status(code);
     }
-    Ok(Response::new(Full::new(Bytes::from_static(b"ok\n"))))
+    Response::new(Full::new(Bytes::from_static(b"ok\n")))
 }
 
 /// Return an empty answer with the status `code`. Return `400` if `code` is not

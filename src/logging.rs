@@ -4,6 +4,7 @@
 //!   do not depend on `RUST_LOG`.
 //! - The other logs go to STDERR, as text. `RUST_LOG` sets their level.
 
+use std::io::IsTerminal;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
@@ -26,6 +27,8 @@ pub fn init() {
         );
     let text = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
+        // Colours only for a person at a terminal, not for a file or a pipe.
+        .with_ansi(std::io::stderr().is_terminal())
         .with_filter(text_filter);
 
     let audit = tracing_subscriber::fmt::layer()

@@ -227,6 +227,40 @@ async fn status_returns_400_for_an_invalid_code() {
 
 #[tokio::test]
 #[serial]
+async fn writes_one_info_log_line_for_each_request() {
+    let server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+    let request = Request::builder()
+        .uri(format!("http://{ADDR}/status/404?token=query-secret"))
+        .header("x-request-id", "log-test-1")
+        .header("authorization", "Bearer header-secret")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(request).await.expect("the request failed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let log = server.stderr();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("request"))
+        .collect();
+    // The line for the start ("listening") has no `request` field.
+    let line = lines
+        .iter()
+        .find(|line| line.contains(r#"request_id="log-test-1""#))
+        .unwrap_or_else(|| panic!("no log line for the request:\n{log}"));
+    assert!(line.contains("INFO"), "{line}");
+    assert!(line.contains("method=GET"), "{line}");
+    assert!(line.contains("path=/status/404"), "{line}");
+    assert!(line.contains("status=404"), "{line}");
+    // Never log the query or the other headers.
+    assert!(!log.contains("query-secret"), "{log}");
+    assert!(!log.contains("header-secret"), "{log}");
+}
+
+#[tokio::test]
+#[serial]
 async fn ctrl_c_stops_the_server_with_exit_code_0() {
     let mut server = Server::start().await;
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
