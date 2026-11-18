@@ -41,6 +41,15 @@ The script uses `openssl`. It writes these files to `dev-certs/`:
 - `reporting-agent.pem` and `reporting-agent.key`: a client certificate (EC P-256),
   signed by the CA. Its URI SAN is `spiffe://acme/prod/reporting-agent`.
 
+The script also makes files for tests that must fail. The proxy must reject
+these clients:
+
+- `other-ca.pem` and `other-ca.key`: a second CA. The proxy does not trust it.
+- `untrusted-agent.pem` and `untrusted-agent.key`: a client certificate that the
+  second CA signed.
+- `expired-agent.pem` and `expired-agent.key`: a client certificate that the CA
+  signed. It expired in January 2020. The `check` command does not report it.
+
 The certificates are valid for 30 days. The script is safe to run many times.
 It makes only the files that are missing or expired.
 

@@ -61,6 +61,18 @@ const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.ke
 const CLIENT_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.pem");
 const CLIENT_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.key");
 
+/// A client certificate and key that a second CA signed. The proxy does not
+/// trust that CA.
+const UNTRUSTED_CERT_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/untrusted-agent.pem");
+const UNTRUSTED_KEY_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/untrusted-agent.key");
+
+/// A client certificate and key that the dev CA signed. The certificate expired
+/// in January 2020.
+const EXPIRED_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.pem");
+const EXPIRED_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.key");
+
 /// A running copy of the program. The process stops when this value is dropped.
 struct Program {
     child: Child,
@@ -189,6 +201,13 @@ fn client() -> TestClient {
 /// Make a TLS connector that trusts the dev CA, sends the client certificate
 /// and offers `alpn` protocols.
 fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
+    make_connector(alpn, Some((CLIENT_CERT_PATH, CLIENT_KEY_PATH)))
+}
+
+/// Make a TLS connector that trusts the dev CA and offers `alpn` protocols.
+/// `client_auth` is the certificate file and the key file of the client. With
+/// `None`, the connector sends no client certificate.
+fn make_connector(alpn: &[&[u8]], client_auth: Option<(&str, &str)>) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let certs = CertificateDer::pem_file_iter(CA_PATH)
         .expect("cannot read the CA. Run ./scripts/gen-dev-certs.sh first");
@@ -197,19 +216,24 @@ fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
             .add(cert.expect("the CA file is not valid"))
             .expect("the CA certificate is not valid");
     }
-    let client_certs = CertificateDer::pem_file_iter(CLIENT_CERT_PATH)
-        .expect("cannot read the client certificate. Run ./scripts/gen-dev-certs.sh first")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("the client certificate file is not valid");
-    let client_key =
-        PrivateKeyDer::from_pem_file(CLIENT_KEY_PATH).expect("cannot read the client key");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("invalid protocol versions")
-        .with_root_certificates(roots)
-        .with_client_auth_cert(client_certs, client_key)
-        .expect("the client certificate does not match the key");
+        .with_root_certificates(roots);
+    let mut config = match client_auth {
+        Some((cert_path, key_path)) => {
+            let certs = CertificateDer::pem_file_iter(cert_path)
+                .expect("cannot read the client certificate. Run ./scripts/gen-dev-certs.sh first")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("the client certificate file is not valid");
+            let key = PrivateKeyDer::from_pem_file(key_path).expect("cannot read the client key");
+            builder
+                .with_client_auth_cert(certs, key)
+                .expect("the client certificate does not match the key")
+        }
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
     TlsConnector::from(Arc::new(config))
 }
@@ -224,6 +248,35 @@ async fn connect(connector: &TlsConnector) -> TlsStream<tokio::net::TcpStream> {
         .connect(name, tcp)
         .await
         .expect("the TLS handshake failed")
+}
+
+/// Check that the proxy rejects the client of `connector` in the TLS handshake.
+///
+/// With TLS 1.3, the client can finish its side of the handshake before the
+/// server checks the client certificate. So the rejection can show when the
+/// client connects, or when it reads. In both cases the client gets no HTTP
+/// response. After that, a client with a valid certificate still works.
+async fn assert_rejected(connector: &TlsConnector) {
+    let tcp = tokio::net::TcpStream::connect(PROXY_ADDR)
+        .await
+        .expect("failed to connect to the proxy");
+    let name = ServerName::try_from("localhost").expect("not a valid name");
+    if let Ok(mut stream) = connector.connect(name, tcp).await {
+        let _ = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut reply = Vec::new();
+        let result = stream.read_to_end(&mut reply).await;
+        assert!(
+            result.is_err() || reply.is_empty(),
+            "the proxy answered a client with a bad certificate: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    // The upstream is not running, so a request that passes gets `502`.
+    let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
 /// Send a request to the proxy with a valid `x-api-key`. Return the status,
@@ -520,6 +573,35 @@ async fn rejects_a_request_without_an_api_key_before_it_reaches_the_upstream() {
 
     let (status, _, _) = send_raw(&client, Method::GET, "/", &[("x-api-key", "")], "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_client_without_a_certificate() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    assert_rejected(&make_connector(&[b"http/1.1"], None)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_client_certificate_from_an_untrusted_ca() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let connector = make_connector(
+        &[b"http/1.1"],
+        Some((UNTRUSTED_CERT_PATH, UNTRUSTED_KEY_PATH)),
+    );
+
+    assert_rejected(&connector).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_an_expired_client_certificate() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let connector = make_connector(&[b"http/1.1"], Some((EXPIRED_CERT_PATH, EXPIRED_KEY_PATH)));
+
+    assert_rejected(&connector).await;
 }
 
 #[tokio::test]
