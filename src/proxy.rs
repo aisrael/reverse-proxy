@@ -14,6 +14,8 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
 use hyper::body::Incoming;
+use hyper::header::HOST;
+use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -22,6 +24,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +107,9 @@ fn spawn_connection(
     let builder = builder.clone();
     let watcher = graceful.watcher();
     tokio::spawn(async move {
-        let service = service_fn(move |request| handle(client.clone(), upstream.clone(), request));
+        let client_ip = peer.ip();
+        let service =
+            service_fn(move |request| handle(client.clone(), upstream.clone(), client_ip, request));
         // The connection borrows `builder`, so create it inside the task.
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
@@ -116,16 +121,33 @@ fn spawn_connection(
 }
 
 /// Send `request` to `upstream` (a `host:port` address) and return the response.
+/// `client_ip` is the IP address of the client.
 ///
-/// Keep the method, the path and the query. Stream both bodies. Remove the
-/// hop-by-hop headers from the request and from the response. Keep the other
-/// headers.
+/// Keep the method, the path and the query. Stream both bodies. Change the
+/// headers as a proxy must:
+///
+/// - Remove the hop-by-hop headers from the request and from the response.
+/// - Replace the forwarding headers of the request (`X-Forwarded-*`, `Via`).
+/// - Set `Host` of the request to the address of the upstream.
+///
+/// Keep the other headers.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     client: UpstreamClient,
     upstream: Arc<str>,
+    client_ip: IpAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
+    // The host that the client asked for. An HTTP/2 request has no `Host`
+    // header, but its URI has the authority.
+    let original_host = request.headers().get(HOST).cloned().or_else(|| {
+        request
+            .uri()
+            .authority()
+            .and_then(|authority| HeaderValue::from_str(authority.as_str()).ok())
+    });
+    let client_version = request.version();
+
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -140,7 +162,16 @@ async fn handle(
     *request.uri_mut() = uri;
     // The connection to the upstream is HTTP/1, also when the client uses HTTP/2.
     *request.version_mut() = Version::HTTP_11;
-    headers::remove_hop_by_hop(request.headers_mut());
+    let request_headers = request.headers_mut();
+    headers::remove_hop_by_hop(request_headers);
+    headers::set_forwarding(
+        request_headers,
+        client_ip,
+        original_host.as_ref(),
+        "http",
+        client_version,
+    );
+    headers::set_host(request_headers, &upstream);
 
     match client.request(request).await {
         Ok(response) => {

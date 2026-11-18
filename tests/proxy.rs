@@ -250,6 +250,69 @@ async fn forwards_a_large_body_both_ways() {
 
 #[tokio::test]
 #[serial]
+async fn replaces_the_forwarding_headers_and_the_host() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The `server` mode sends the request headers back, so the response shows
+    // what the upstream received.
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "evil.example"),
+            ("forwarded", "for=1.2.3.4"),
+            ("via", "1.1 other"),
+        ],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get_all("x-forwarded-for").iter().count(), 1);
+    assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
+    assert_eq!(headers["x-forwarded-proto"], "http");
+    assert_eq!(headers["x-forwarded-host"], PROXY_ADDR);
+    assert_eq!(headers["via"], "1.1 reverse-proxy");
+    assert!(!headers.contains_key("forwarded"));
+    assert_eq!(headers["host"], SERVER_ADDR);
+}
+
+#[tokio::test]
+#[serial]
+async fn removes_the_hop_by_hop_headers() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The `server` mode sends the request headers back, so the response shows
+    // what the upstream received.
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[
+            ("connection", "x-secret"),
+            ("x-secret", "1"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-authorization", "Basic abc"),
+            ("x-kept", "yes"),
+        ],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("x-secret"));
+    assert!(!headers.contains_key("keep-alive"));
+    assert!(!headers.contains_key("proxy-authorization"));
+    assert_eq!(headers["x-kept"], "yes");
+}
+
+#[tokio::test]
+#[serial]
 async fn returns_502_when_the_upstream_is_down() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
 
