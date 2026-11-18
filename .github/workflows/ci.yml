@@ -9,6 +9,7 @@ on:
       - "crates/**"
       - ".cargo/**"
       - "Cargo.*"
+      - "policies.yaml"
       - ".rustfmt.toml"
       - "README.md"
       - ".github/workflows/ci.yml"

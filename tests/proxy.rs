@@ -51,6 +51,7 @@ const SERVER_ADDR: &str = "127.0.0.1:9000";
 
 /// The certificate of the dev CA. The proxy uses a certificate that this CA signed.
 const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/ca.pem");
+const POLICY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/policies.yaml");
 
 /// The certificate and the key of the proxy.
 const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.pem");
@@ -114,6 +115,7 @@ impl Program {
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
             .env("PROXY_CLIENT_CA", CA_PATH)
+            .env("PROXY_POLICY_FILE", POLICY_PATH)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -652,8 +654,13 @@ async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
 
 #[tokio::test]
 #[serial]
-async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
-    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY", "PROXY_CLIENT_CA"] {
+async fn exits_with_code_1_when_a_required_variable_is_not_set() {
+    for missing in [
+        "PROXY_TLS_CERT",
+        "PROXY_TLS_KEY",
+        "PROXY_CLIENT_CA",
+        "PROXY_POLICY_FILE",
+    ] {
         // The program must stop before it binds, so it needs no free port.
         let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
             .arg("proxy")
@@ -662,6 +669,7 @@ async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
             .env("PROXY_CLIENT_CA", CA_PATH)
+            .env("PROXY_POLICY_FILE", POLICY_PATH)
             .env_remove(missing)
             .output()
             .expect("failed to run the program");

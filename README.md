@@ -14,10 +14,12 @@ set must not be empty.
 | `PROXY_TLS_CERT` | none (required)  | `proxy`  | The path of the certificate file (PEM).                    |
 | `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
 | `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. |
+| `PROXY_POLICY_FILE` | none (required) | `proxy` | The path of the policy file (YAML). See `policies.yaml`. |
 | `RUST_LOG`       | `info`           | both     | The log level, for example `debug`.                        |
 
 The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT`,
-`PROXY_TLS_KEY` or `PROXY_CLIENT_CA` is not set, or if a file cannot be read.
+`PROXY_TLS_KEY`, `PROXY_CLIENT_CA` or `PROXY_POLICY_FILE` is not set, or if a
+file cannot be read or is not valid.
 The `server` mode does not use the TLS variables.
 
 The `proxy` mode requires a client certificate (mTLS). A client without a

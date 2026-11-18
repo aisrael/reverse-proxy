@@ -31,6 +31,8 @@ pub struct Config {
     /// The path of the CA bundle file (PEM) that signs the client certificates.
     /// Only the `proxy` mode needs it.
     client_ca: Option<String>,
+    /// The path of the policy file (YAML). Only the `proxy` mode needs it.
+    policy_file: Option<String>,
 }
 
 /// The address of the `proxy` mode when `PROXY_ADDR` is not set.
@@ -85,6 +87,7 @@ impl Config {
             tls_cert: try_read_optional_from_env("PROXY_TLS_CERT")?,
             tls_key: try_read_optional_from_env("PROXY_TLS_KEY")?,
             client_ca: try_read_optional_from_env("PROXY_CLIENT_CA")?,
+            policy_file: try_read_optional_from_env("PROXY_POLICY_FILE")?,
         })
     }
 
@@ -119,6 +122,14 @@ impl Config {
             .as_deref()
             .ok_or(ConfigError::NotSet("PROXY_CLIENT_CA"))
     }
+
+    /// The path of the policy file.
+    /// Return an error if `PROXY_POLICY_FILE` is not set.
+    pub fn policy_file(&self) -> Result<&str, ConfigError> {
+        self.policy_file
+            .as_deref()
+            .ok_or(ConfigError::NotSet("PROXY_POLICY_FILE"))
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +153,7 @@ mod tests {
             tls_cert: tls_cert.map(Into::into),
             tls_key: tls_key.map(Into::into),
             client_ca: None,
+            policy_file: None,
         }
     }
 
@@ -305,6 +317,24 @@ mod tests {
         assert!(matches!(
             config.client_ca(),
             Err(ConfigError::NotSet("PROXY_CLIENT_CA"))
+        ));
+    }
+
+    #[test]
+    fn policy_file_returns_the_path() {
+        let mut config = config(None, None);
+        config.policy_file = Some("policies.yaml".into());
+
+        assert_eq!(config.policy_file().unwrap(), "policies.yaml");
+    }
+
+    #[test]
+    fn policy_file_names_the_variable_when_it_is_not_set() {
+        let config = config(None, None);
+
+        assert!(matches!(
+            config.policy_file(),
+            Err(ConfigError::NotSet("PROXY_POLICY_FILE"))
         ));
     }
 }
