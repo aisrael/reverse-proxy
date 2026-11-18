@@ -1,4 +1,3 @@
-mod admission;
 mod config;
 mod errors;
 mod headers;

@@ -2,7 +2,6 @@
 //!
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
-use crate::admission;
 use crate::headers;
 use crate::identity::Identity;
 use crate::state::AppState;
@@ -182,12 +181,11 @@ where
     // Keep the method and the path for the log line. Never log the query.
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let admitted = admission::admit(request.headers());
     let prepared = prepare_request(&mut request, &state.upstream, client_ip);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
     let request_id = headers::ensure_request_id(request.headers_mut());
-    let mut response = if !admitted {
+    let mut response = if identity.is_none() {
         unauthorized()
     } else {
         match prepared {
@@ -285,8 +283,9 @@ where
     }
 }
 
-/// The answer for a request that admission rejects. The proxy does not
-/// connect to the upstream. The response has the status `401` and an empty body.
+/// The answer for a request from a client without a valid identity. The proxy
+/// does not connect to the upstream. The response has the status `401` and an
+/// empty body.
 fn unauthorized() -> Response<Body> {
     let body = Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -315,14 +314,14 @@ mod tests {
     /// `handle` then returns at once. It makes no connection and opens no socket.
     const BAD_UPSTREAM: &str = "not a valid address";
 
-    /// Call `handle` with a valid `x-api-key` and the given headers.
+    /// Call `handle` as a client with a valid identity.
     async fn call(headers: &[(&str, &str)]) -> Response<Body> {
-        let mut all = vec![("x-api-key", "test")];
-        all.extend_from_slice(headers);
-        call_raw(&all).await
+        let identity = "spiffe://acme/prod/payment-agent".parse().unwrap();
+        call_as(Some(identity), headers).await
     }
 
-    async fn call_raw(headers: &[(&str, &str)]) -> Response<Body> {
+    /// Call `handle` with the given identity and headers.
+    async fn call_as(identity: Option<Identity>, headers: &[(&str, &str)]) -> Response<Body> {
         let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM));
         let mut request = Request::builder().uri("/path?x=1");
         for (name, value) in headers {
@@ -330,7 +329,7 @@ mod tests {
         }
         let request = request.body(Full::new(Bytes::new())).unwrap();
 
-        match handle(state, "192.0.2.7".parse().unwrap(), None, request).await {
+        match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
             Ok(response) => response,
             Err(never) => match never {},
         }
@@ -346,20 +345,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_returns_401_without_an_api_key() {
-        let response = call_raw(&[]).await;
+    async fn handle_returns_401_without_a_valid_identity() {
+        let response = call_as(None, &[]).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()["x-request-id"].len(), 36);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
-    }
-
-    #[tokio::test]
-    async fn handle_returns_401_with_an_empty_api_key() {
-        let response = call_raw(&[("x-api-key", "")]).await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
