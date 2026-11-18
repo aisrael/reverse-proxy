@@ -6,6 +6,7 @@ mod identity;
 mod logging;
 mod policy;
 mod proxy;
+mod reload;
 mod server;
 mod state;
 mod tls;
@@ -53,9 +54,11 @@ async fn main() -> Result<(), Error> {
             config.check_upstream_is_not_proxy()?;
             let (cert_path, key_path) = config.tls_paths()?;
             let client_ca_path = config.client_ca()?;
-            let tls_config = tls::server_config(cert_path, key_path, client_ca_path)?;
+            let (tls_config, client_verifier) =
+                tls::server_config(cert_path, key_path, client_ca_path)?;
             let policies = policy::load(config.policy_file()?)?;
             info!(identities = policies.policies.len(), "policy loaded");
+            reload::watch_client_ca(client_ca_path, client_verifier, shutdown.clone())?;
             let acceptor = TlsAcceptor::from(Arc::new(tls_config));
             let listener = bind(config.proxy_addr()).await?;
             proxy::serve(listener, shutdown, acceptor, config.server_addr(), policies).await

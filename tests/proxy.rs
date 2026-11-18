@@ -105,6 +105,11 @@ impl Program {
     /// the STDERR too if the program does not accept connections within 10
     /// seconds.
     async fn start(mode: &str, addr: &'static str) -> Self {
+        Self::start_with_ca(mode, addr, CA_PATH).await
+    }
+
+    /// Start the program as `start` does, with the CA bundle file `client_ca`.
+    async fn start_with_ca(mode: &str, addr: &'static str, client_ca: &str) -> Self {
         assert!(
             TcpStream::connect(addr).is_err(),
             "another process uses {addr}. Stop it and run the tests again"
@@ -128,7 +133,7 @@ impl Program {
             .env("SERVER_ADDR", SERVER_ADDR)
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
-            .env("PROXY_CLIENT_CA", CA_PATH)
+            .env("PROXY_CLIENT_CA", client_ca)
             .env("PROXY_POLICY_FILE", POLICY_PATH)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
@@ -1010,4 +1015,165 @@ async fn exits_with_code_1_when_a_required_variable_is_not_set() {
         assert_eq!(output.status.code(), Some(1), "{missing}: {stderr}");
         assert!(stderr.contains(missing), "{missing}: {stderr}");
     }
+}
+
+/// The path of a file in the `dev-certs` directory.
+fn dev_cert_path(name: &str) -> String {
+    format!("{}/dev-certs/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Make an empty directory in the temporary directory for a test.
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("reverse-proxy-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("failed to create the directory");
+    dir
+}
+
+/// Replace `target` with a copy of `source`. Write a new file and rename it, so
+/// the proxy never sees a half-written file.
+fn replace_file(target: &std::path::Path, source: &str) {
+    let new = target.with_extension("new");
+    std::fs::copy(source, &new).expect("failed to copy the file");
+    std::fs::rename(&new, target).expect("failed to rename the file");
+}
+
+/// Connect with `connector` and send one request. Return `true` if the proxy
+/// sends an HTTP response, so the TLS handshake worked.
+async fn gets_a_response(connector: &TlsConnector) -> bool {
+    let Ok(tcp) = tokio::net::TcpStream::connect(PROXY_ADDR).await else {
+        return false;
+    };
+    let name = ServerName::try_from("localhost").expect("not a valid name");
+    let Ok(mut stream) = connector.connect(name, tcp).await else {
+        return false;
+    };
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request).await.is_err() {
+        return false;
+    }
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply).await;
+    reply.starts_with(b"HTTP/1.1")
+}
+
+/// Wait until `gets_a_response` gives `expected` for `connector`. Panic after 10 seconds.
+async fn wait_for_handshake(connector: &TlsConnector, expected: bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gets_a_response(connector).await != expected {
+        assert!(Instant::now() < deadline, "{what}");
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn connector_for(agent: &str) -> TlsConnector {
+    make_connector(
+        &[b"http/1.1"],
+        Some((
+            &dev_cert_path(&format!("{agent}.pem")),
+            &dev_cert_path(&format!("{agent}.key")),
+        )),
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn trusts_the_new_cas_after_the_ca_file_changes() {
+    let dir = temp_dir("reload-ca");
+    let ca_file = dir.join("ca.pem");
+    std::fs::copy(CA_PATH, &ca_file).unwrap();
+    let _proxy = Program::start_with_ca("proxy", PROXY_ADDR, ca_file.to_str().unwrap()).await;
+    let payment = connector_for("payment-agent");
+    let untrusted = connector_for("untrusted-agent");
+    assert!(gets_a_response(&payment).await);
+    assert!(!gets_a_response(&untrusted).await);
+
+    replace_file(&ca_file, &dev_cert_path("other-ca.pem"));
+
+    wait_for_handshake(&untrusted, true, "the new CA is not trusted").await;
+    assert!(!gets_a_response(&payment).await, "the old CA is trusted");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn keeps_the_old_cas_when_the_new_ca_file_is_not_valid() {
+    let dir = temp_dir("reload-bad-ca");
+    let ca_file = dir.join("ca.pem");
+    std::fs::copy(CA_PATH, &ca_file).unwrap();
+    let proxy = Program::start_with_ca("proxy", PROXY_ADDR, ca_file.to_str().unwrap()).await;
+    let payment = connector_for("payment-agent");
+
+    std::fs::write(&ca_file, "not a PEM file\n").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !proxy.stderr().contains("keeping the old CAs") {
+        assert!(Instant::now() < deadline, "no warning:\n{}", proxy.stderr());
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gets_a_response(&payment).await, "the old CA is not trusted");
+
+    // A good file works again after the bad one.
+    replace_file(&ca_file, &dev_cert_path("other-ca.pem"));
+    wait_for_handshake(&connector_for("untrusted-agent"), true, "no reload").await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn lets_an_open_connection_finish_after_its_ca_is_removed() {
+    let dir = temp_dir("reload-open-connection");
+    let ca_file = dir.join("ca.pem");
+    std::fs::copy(CA_PATH, &ca_file).unwrap();
+    let _proxy = Program::start_with_ca("proxy", PROXY_ADDR, ca_file.to_str().unwrap()).await;
+    let payment = connector_for("payment-agent");
+    let stream = connect(&payment).await;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("the HTTP handshake failed");
+    tokio::spawn(connection);
+    let request = || {
+        Request::builder()
+            .uri("/")
+            .header(HOST, PROXY_ADDR)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    // No upstream runs, so a request that passes gets `502`.
+    let first = sender.send_request(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+
+    replace_file(&ca_file, &dev_cert_path("other-ca.pem"));
+    wait_for_handshake(&payment, false, "the old CA is still trusted").await;
+
+    let second = sender.send_request(request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn reloads_the_ca_file_when_a_symbolic_link_changes() {
+    use std::os::unix::fs::symlink;
+    // The layout of a Kubernetes volume: `ca.pem` -> `data/ca.pem`, and `data` -> `v1`.
+    let dir = temp_dir("reload-symlink");
+    for (version, source) in [
+        ("v1", CA_PATH.to_string()),
+        ("v2", dev_cert_path("other-ca.pem")),
+    ] {
+        std::fs::create_dir(dir.join(version)).unwrap();
+        std::fs::copy(source, dir.join(version).join("ca.pem")).unwrap();
+    }
+    symlink("v1", dir.join("data")).unwrap();
+    symlink("data/ca.pem", dir.join("ca.pem")).unwrap();
+    let ca_file = dir.join("ca.pem");
+    let _proxy = Program::start_with_ca("proxy", PROXY_ADDR, ca_file.to_str().unwrap()).await;
+    let untrusted = connector_for("untrusted-agent");
+    assert!(!gets_a_response(&untrusted).await);
+
+    symlink("v2", dir.join("data.new")).unwrap();
+    std::fs::rename(dir.join("data.new"), dir.join("data")).unwrap();
+
+    wait_for_handshake(&untrusted, true, "the new CA is not trusted").await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }

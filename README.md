@@ -13,7 +13,7 @@ set must not be empty.
 | `SERVER_ADDR`    | `127.0.0.1:9000` | both     | The address of the `server` mode. The proxy sends its requests here. |
 | `PROXY_TLS_CERT` | none (required)  | `proxy`  | The path of the certificate file (PEM).                    |
 | `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
-| `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. |
+| `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. The proxy reloads it when it changes. |
 | `PROXY_POLICY_FILE` | none (required) | `proxy` | The path of the policy file (YAML). See `policies.yaml`. |
 | `RUST_LOG`       | `info`           | both     | The log level of the logs on STDERR, for example `debug`. It does not change the audit events. |
 
@@ -25,6 +25,12 @@ The `server` mode does not use the TLS variables.
 
 The `proxy` mode requires a client certificate (mTLS). A client without a
 certificate that the CA in `PROXY_CLIENT_CA` signed fails the TLS handshake.
+
+The proxy watches the `PROXY_CLIENT_CA` file. When the file changes, it loads
+the new CAs without a restart. New connections use them. Connections that are
+open, and the requests that are running, do not change. If the new file is not
+valid, the proxy writes a warning to STDERR and keeps the old CAs. The proxy does
+not resume TLS sessions. See `docs/adrs/003-reload-the-client-ca-bundle.md`.
 
 ## Policy
 

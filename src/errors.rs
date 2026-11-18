@@ -27,6 +27,9 @@ pub enum Error {
         path: String,
         source: rustls_pki_types::pem::Error,
     },
+    /// The watcher for the CA bundle file cannot start.
+    #[error("cannot watch the client CA file: {0}")]
+    Watch(#[from] notify::Error),
     /// The policy file cannot be read or is not valid.
     #[error("policy error: {0}")]
     Policy(#[from] PolicyError),
