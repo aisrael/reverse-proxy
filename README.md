@@ -13,6 +13,7 @@ set must not be empty.
 | `SERVER_ADDR`    | `127.0.0.1:9000` | both     | The address of the `server` mode. The proxy sends its requests here. |
 | `PROXY_TLS_CERT` | none (required)  | `proxy`  | The path of the certificate file (PEM).                    |
 | `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
+| `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. |
 | `RUST_LOG`       | `info`           | both     | The log level, for example `debug`.                        |
 
 The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT` or

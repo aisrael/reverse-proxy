@@ -18,3 +18,8 @@ export PROXY_TLS_CERT="dev-certs/server.pem"
 
 # The path of the private key file (PEM) for the certificate. There is no default.
 export PROXY_TLS_KEY="dev-certs/server.key"
+
+# The path of the CA bundle file (PEM) for the `proxy` mode. The proxy accepts
+# only clients with a certificate that this CA signed. There is no default. The
+# dev CA from `./scripts/gen-dev-certs.sh` signs the dev client certificates.
+export PROXY_CLIENT_CA="dev-certs/ca.pem"
