@@ -1,0 +1,40 @@
+# The shape of the policy file (see `policies.yaml`).
+# The proxy checks the file against this schema at start, before it reads the
+# file as a policy. A method can have any letter case.
+#
+# This is a YAML schema. It uses the keywords of JSON Schema, written in YAML.
+# For the syntax, see https://yaml-schema.net/
+type: object
+required:
+  - policies
+additionalProperties: false
+properties:
+  policies:
+    type: array
+    items:
+      type: object
+      required:
+        - identity
+        - allow
+      additionalProperties: false
+      properties:
+        identity:
+          type: string
+          format: uri
+          pattern: "^spiffe://"
+        allow:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+              - method
+              - path
+            additionalProperties: false
+            properties:
+              method:
+                type: string
+                pattern: "^(?i)(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH)$"
+              path:
+                type: string
+                pattern: "^/"

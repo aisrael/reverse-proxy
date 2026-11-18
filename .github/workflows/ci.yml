@@ -10,6 +10,7 @@ on:
       - ".cargo/**"
       - "Cargo.*"
       - "policies.yaml"
+      - "policy-schema.yaml"
       - ".rustfmt.toml"
       - "README.md"
       - ".github/workflows/ci.yml"

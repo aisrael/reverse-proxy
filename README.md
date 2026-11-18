@@ -33,6 +33,18 @@ identity (SPIFFE ID), the methods and paths that it may use. A path is exact
 (`/payments`) or a prefix (`/reports/*`). A prefix matches whole segments, and
 needs at least one more segment. The proxy ignores the query.
 
+The proxy checks the policy file when it starts, and stops at the first problem
+(exit code 1):
+
+1. The file must follow the schema in `policy-schema.yaml`. It is a
+   [YAML schema](https://yaml-schema.net/) that the program has built in. The
+   schema checks the fields (no unknown field, `allow` is not empty), that the
+   `identity` is a `spiffe://` URI, and that the `method` is an HTTP method.
+   A method can have any letter case (`GET` or `get`).
+2. The values must be valid. An `identity` must be a valid SPIFFE ID. In a
+   `path`, a `*` is only allowed as the last segment, as `/*`. A path that no
+   request can match, for example `/a/../b`, is an error.
+
 The proxy answers with an empty body, and does not send the request to the
 upstream, in these cases:
 
