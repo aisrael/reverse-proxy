@@ -73,6 +73,11 @@ const UNTRUSTED_KEY_PATH: &str =
 const EXPIRED_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.pem");
 const EXPIRED_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.key");
 
+/// A client certificate and key that the dev CA signed. The certificate has no
+/// URI SAN, so the client has no identity.
+const NO_URI_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/no-uri-agent.pem");
+const NO_URI_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/no-uri-agent.key");
+
 /// A running copy of the program. The process stops when this value is dropped.
 struct Program {
     child: Child,
@@ -279,22 +284,8 @@ async fn assert_rejected(connector: &TlsConnector) {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
-/// Send a request to the proxy with a valid `x-api-key`. Return the status,
-/// the headers and the body.
+/// Send a request to the proxy. Return the status, the headers and the body.
 async fn send(
-    client: &TestClient,
-    method: Method,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: impl Into<Bytes>,
-) -> (StatusCode, HeaderMap, Bytes) {
-    let mut all = vec![("x-api-key", "test")];
-    all.extend_from_slice(headers);
-    send_raw(client, method, path, &all, body).await
-}
-
-/// Send a request to the proxy with exactly the given headers.
-async fn send_raw(
     client: &TestClient,
     method: Method,
     path: &str,
@@ -562,21 +553,6 @@ async fn returns_502_when_the_upstream_is_down() {
 
 #[tokio::test]
 #[serial]
-async fn rejects_a_request_without_an_api_key_before_it_reaches_the_upstream() {
-    // No upstream runs. A 502 would mean that the proxy tried to connect.
-    let _proxy = Program::start("proxy", PROXY_ADDR).await;
-    let client = client();
-
-    let (status, _, body) = send_raw(&client, Method::GET, "/", &[], "").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(body.is_empty());
-
-    let (status, _, _) = send_raw(&client, Method::GET, "/", &[("x-api-key", "")], "").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-#[serial]
 async fn rejects_a_client_without_a_certificate() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
 
@@ -602,6 +578,22 @@ async fn rejects_an_expired_client_certificate() {
     let connector = make_connector(&[b"http/1.1"], Some((EXPIRED_CERT_PATH, EXPIRED_KEY_PATH)));
 
     assert_rejected(&connector).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_request_from_a_certificate_without_an_identity() {
+    // No upstream runs. A 502 would mean that the proxy tried to connect.
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = TestClient {
+        connector: make_connector(&[b"http/1.1"], Some((NO_URI_CERT_PATH, NO_URI_KEY_PATH))),
+    };
+
+    let (status, headers, body) = send(&client, Method::GET, "/", &[], "").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.contains_key("x-request-id"));
+    assert!(body.is_empty());
 }
 
 #[tokio::test]
