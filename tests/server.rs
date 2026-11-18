@@ -26,7 +26,7 @@ use std::time::Instant;
 use tokio::time::sleep;
 
 /// The address that the server listens on.
-const ADDR: &str = "127.0.0.1:8080";
+const ADDR: &str = "127.0.0.1:9000";
 
 /// A running server. The process stops when this value is dropped.
 struct Server {

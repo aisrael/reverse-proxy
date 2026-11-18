@@ -24,7 +24,7 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 /// Address of the `server` mode. It is fixed for now.
-const LISTEN_ADDR: &str = "127.0.0.1:8080";
+const LISTEN_ADDR: &str = "127.0.0.1:9000";
 
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
