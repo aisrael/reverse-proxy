@@ -327,6 +327,80 @@ async fn passes_a_503_with_retry_after_through_unchanged() {
 
 #[tokio::test]
 #[serial]
+async fn keeps_a_valid_request_id_and_sends_it_both_ways() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The `server` mode sends the request headers back. The response then shows
+    // the ID that the upstream received.
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[("x-request-id", "client-id-1")],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get_all("x-request-id").iter().count(), 1);
+    assert_eq!(headers["x-request-id"], "client-id-1");
+}
+
+#[tokio::test]
+#[serial]
+async fn makes_a_request_id_when_the_client_sends_none() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = client();
+
+    let (_, first, _) = send(&client, Method::GET, "/echo", &[], "").await;
+    let (_, second, _) = send(&client, Method::GET, "/echo", &[], "").await;
+
+    assert_eq!(first["x-request-id"].len(), 36);
+    assert_ne!(first["x-request-id"], second["x-request-id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn replaces_a_request_id_that_is_not_valid() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let too_long = "a".repeat(200);
+
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[("x-request-id", &too_long)],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-request-id"].len(), 36);
+}
+
+#[tokio::test]
+#[serial]
+async fn returns_a_request_id_on_a_502() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/",
+        &[("x-request-id", "client-id-2")],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(headers["x-request-id"], "client-id-2");
+}
+
+#[tokio::test]
+#[serial]
 async fn returns_502_when_the_upstream_is_down() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
 

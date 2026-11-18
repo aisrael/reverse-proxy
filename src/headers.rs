@@ -12,6 +12,12 @@ use std::net::IpAddr;
 /// The name that the proxy gives itself in the `Via` header.
 const PROXY_NAME: &str = "reverse-proxy";
 
+/// The header that carries the request ID.
+pub const REQUEST_ID: &str = "x-request-id";
+
+/// The longest request ID that the proxy accepts from a client.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
 /// Headers that apply to one connection only. A proxy must not pass them on.
 const HOP_BY_HOP: [&str; 8] = [
     "connection",
@@ -86,6 +92,33 @@ pub fn set_forwarding(
 /// Set `Host` to the address of the upstream (`host:port`).
 pub fn set_host(headers: &mut HeaderMap, upstream: &str) {
     insert(headers, HOST.as_str(), upstream);
+}
+
+/// Make sure that `headers` has exactly one valid `X-Request-Id`. Return its value.
+///
+/// Keep the first value if it is valid. A valid value has 1 to 128 characters,
+/// and each character is a letter, a digit, or one of `-`, `_`, `.` and `:`.
+/// Otherwise replace it with a new UUID. This stops a client from putting
+/// long or odd text in the logs.
+pub fn ensure_request_id(headers: &mut HeaderMap) -> HeaderValue {
+    let value = headers
+        .get(REQUEST_ID)
+        .filter(|value| is_valid_request_id(value.as_bytes()))
+        .cloned()
+        .unwrap_or_else(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            HeaderValue::from_str(&id).expect("a UUID is a valid header value")
+        });
+    headers.insert(REQUEST_ID, value.clone());
+    value
+}
+
+/// True if `value` is a valid request ID. See `ensure_request_id`.
+fn is_valid_request_id(value: &[u8]) -> bool {
+    (1..=MAX_REQUEST_ID_LEN).contains(&value.len())
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(byte))
 }
 
 /// The protocol version as the `Via` header writes it.
@@ -230,6 +263,57 @@ mod tests {
 
         assert_eq!(map.get_all("host").iter().count(), 1);
         assert_eq!(map["host"], "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn keeps_a_valid_request_id() {
+        let mut map = headers(&[("x-request-id", "abc-123_X.y:z")]);
+
+        let id = ensure_request_id(&mut map);
+
+        assert_eq!(id, "abc-123_X.y:z");
+        assert_eq!(map["x-request-id"], "abc-123_X.y:z");
+    }
+
+    #[test]
+    fn makes_a_request_id_when_there_is_none() {
+        let mut map = HeaderMap::new();
+
+        let id = ensure_request_id(&mut map);
+
+        assert_eq!(id.len(), 36, "not a UUID: {id:?}");
+        assert_eq!(map["x-request-id"], id);
+    }
+
+    #[test]
+    fn replaces_a_request_id_that_is_not_valid() {
+        let too_long = "a".repeat(129);
+        for bad in ["", "has space", "<script>", too_long.as_str()] {
+            let mut map = headers(&[("x-request-id", bad)]);
+
+            let id = ensure_request_id(&mut map);
+
+            assert_ne!(id, bad);
+            assert_eq!(id.len(), 36, "not a UUID: {id:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_longest_valid_request_id() {
+        let longest = "a".repeat(128);
+        let mut map = headers(&[("x-request-id", longest.as_str())]);
+
+        assert_eq!(ensure_request_id(&mut map), longest.as_str());
+    }
+
+    #[test]
+    fn keeps_one_request_id_when_the_client_sends_two() {
+        let mut map = headers(&[("x-request-id", "first"), ("x-request-id", "second")]);
+
+        let id = ensure_request_id(&mut map);
+
+        assert_eq!(id, "first");
+        assert_eq!(map.get_all("x-request-id").iter().count(), 1);
     }
 
     #[test]
