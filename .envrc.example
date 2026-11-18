@@ -23,3 +23,7 @@ export PROXY_TLS_KEY="dev-certs/server.key"
 # only clients with a certificate that this CA signed. There is no default. The
 # dev CA from `./scripts/gen-dev-certs.sh` signs the dev client certificates.
 export PROXY_CLIENT_CA="dev-certs/ca.pem"
+
+# The path of the policy file (YAML) for the `proxy` mode. It says which client
+# identity may send which requests. There is no default. See `policies.yaml`.
+export PROXY_POLICY_FILE="policies.yaml"

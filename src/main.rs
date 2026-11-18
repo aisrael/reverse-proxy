@@ -2,6 +2,7 @@ mod config;
 mod errors;
 mod headers;
 mod identity;
+mod policy;
 mod proxy;
 mod server;
 mod state;
@@ -53,13 +54,15 @@ async fn main() -> Result<(), Error> {
     let shutdown = shutdown_on_ctrl_c();
     match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {
-            // Check the TLS setup before the bind. A wrong setup stops the proxy at once.
+            // Check the TLS setup and the policy before the bind. A wrong setup stops the proxy at once.
             let (cert_path, key_path) = config.tls_paths()?;
             let client_ca_path = config.client_ca()?;
             let tls_config = tls::server_config(cert_path, key_path, client_ca_path)?;
+            let policies = policy::load(config.policy_file()?)?;
+            info!(identities = policies.policies.len(), "policy loaded");
             let acceptor = TlsAcceptor::from(Arc::new(tls_config));
             let listener = bind(config.proxy_addr()).await?;
-            proxy::serve(listener, shutdown, acceptor, config.server_addr()).await
+            proxy::serve(listener, shutdown, acceptor, config.server_addr(), policies).await
         }
         Command::Server => {
             let listener = bind(config.server_addr()).await?;

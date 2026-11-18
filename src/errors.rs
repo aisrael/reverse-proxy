@@ -1,6 +1,7 @@
 //! The error type of the crate.
 
 use crate::config::ConfigError;
+use crate::policy::PolicyError;
 use thiserror::Error;
 
 /// An error that stops the program.
@@ -26,4 +27,7 @@ pub enum Error {
         path: String,
         source: rustls_pki_types::pem::Error,
     },
+    /// The policy file cannot be read or is not valid.
+    #[error("policy error: {0}")]
+    Policy(#[from] PolicyError),
 }

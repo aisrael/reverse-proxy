@@ -4,6 +4,8 @@
 
 use crate::headers;
 use crate::identity::Identity;
+use crate::policy;
+use crate::policy::Policies;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -54,6 +56,7 @@ type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 /// Accept connections on `listener` until `shutdown` is cancelled.
 /// Every connection uses TLS: `acceptor` does the handshake.
 /// The requests go to the upstream at `upstream` (a `host:port` address).
+/// `policies` say which client identity may send which requests.
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
@@ -62,8 +65,9 @@ pub async fn serve(
     shutdown: CancellationToken,
     acceptor: TlsAcceptor,
     upstream: &str,
+    policies: Policies,
 ) {
-    let state = Arc::new(AppState::new(upstream));
+    let state = Arc::new(AppState::new(upstream, policies));
     info!(upstream = %state.upstream, "sending requests to the upstream");
     let builder = Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
@@ -159,7 +163,14 @@ fn client_identity(connection: &ServerConnection, peer: SocketAddr) -> Option<Id
 /// `client_ip` is the IP address of the client. `identity` is the identity of
 /// the client, if its certificate has a valid one.
 ///
-/// Prepare the request, then forward it.
+/// Check the request, then forward it. The proxy answers with an empty body
+/// and does not connect to the upstream if:
+///
+/// - the client has no valid identity: `401`;
+/// - the path is not valid (see `policy::is_valid_path`): `400`;
+/// - the policy does not allow the identity to send this method and path: `403`.
+///
+/// Otherwise, prepare the request and forward it.
 ///
 /// Every request has a request ID. The upstream gets it in the request, and the
 /// client gets it in the response. Use the `X-Request-Id` of the client if it
@@ -185,16 +196,23 @@ where
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
     let request_id = headers::ensure_request_id(request.headers_mut());
-    let mut response = if identity.is_none() {
-        unauthorized()
-    } else {
-        match prepared {
+    let mut response = match &identity {
+        None => empty(StatusCode::UNAUTHORIZED),
+        Some(_) if !policy::is_valid_path(&path) => empty(StatusCode::BAD_REQUEST),
+        Some(identity)
+            if !state
+                .policies
+                .authorize(&identity.to_string(), method.as_str(), &path) =>
+        {
+            empty(StatusCode::FORBIDDEN)
+        }
+        Some(_) => match prepared {
             Ok(()) => forward(&state, request).await,
             Err(err) => {
                 warn!(%err, "cannot make the upstream URI");
                 bad_gateway()
             }
-        }
+        },
     };
     debug!(
         %method,
@@ -283,15 +301,14 @@ where
     }
 }
 
-/// The answer for a request from a client without a valid identity. The proxy
-/// does not connect to the upstream. The response has the status `401` and an
-/// empty body.
-fn unauthorized() -> Response<Body> {
+/// The answer for a request that the proxy does not forward. The response has
+/// the given `status` and an empty body.
+fn empty(status: StatusCode) -> Response<Body> {
     let body = Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed_unsync();
     let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    *response.status_mut() = status;
     response
 }
 
@@ -314,16 +331,30 @@ mod tests {
     /// `handle` then returns at once. It makes no connection and opens no socket.
     const BAD_UPSTREAM: &str = "not a valid address";
 
-    /// Call `handle` as a client with a valid identity.
-    async fn call(headers: &[(&str, &str)]) -> Response<Body> {
-        let identity = "spiffe://acme/prod/payment-agent".parse().unwrap();
-        call_as(Some(identity), headers).await
+    const PAYMENT_AGENT: &str = "spiffe://acme/prod/payment-agent";
+
+    /// The policy for the tests: `payment-agent` may `GET /path`.
+    fn policies() -> Policies {
+        let yaml = format!(
+            "policies:\n- identity: \"{PAYMENT_AGENT}\"\n  allow:\n  - method: GET\n    path: \"/path\"\n"
+        );
+        serde_saphyr::from_str(&yaml).unwrap()
     }
 
-    /// Call `handle` with the given identity and headers.
-    async fn call_as(identity: Option<Identity>, headers: &[(&str, &str)]) -> Response<Body> {
-        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM));
-        let mut request = Request::builder().uri("/path?x=1");
+    /// Call `handle` as an allowed client (`payment-agent`, `GET /path?x=1`).
+    async fn call(headers: &[(&str, &str)]) -> Response<Body> {
+        call_as(Some(PAYMENT_AGENT), "/path?x=1", headers).await
+    }
+
+    /// Call `handle` with the given identity (a SPIFFE ID), URI and headers.
+    async fn call_as(
+        identity: Option<&str>,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> Response<Body> {
+        let identity = identity.map(|id| id.parse::<Identity>().unwrap());
+        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM, policies()));
+        let mut request = Request::builder().uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -333,6 +364,14 @@ mod tests {
             Ok(response) => response,
             Err(never) => match never {},
         }
+    }
+
+    /// Check that the response has `status`, a request ID and an empty body.
+    async fn assert_rejection(response: Response<Body>, status: StatusCode) {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["x-request-id"].len(), 36);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
@@ -346,12 +385,30 @@ mod tests {
 
     #[tokio::test]
     async fn handle_returns_401_without_a_valid_identity() {
-        let response = call_as(None, &[]).await;
+        let response = call_as(None, "/path", &[]).await;
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response.headers()["x-request-id"].len(), 36);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(body.is_empty());
+        assert_rejection(response, StatusCode::UNAUTHORIZED).await;
+    }
+
+    #[tokio::test]
+    async fn handle_returns_403_for_a_path_that_the_policy_does_not_allow() {
+        let response = call_as(Some(PAYMENT_AGENT), "/other", &[]).await;
+
+        assert_rejection(response, StatusCode::FORBIDDEN).await;
+    }
+
+    #[tokio::test]
+    async fn handle_returns_403_for_an_identity_without_a_policy() {
+        let response = call_as(Some("spiffe://acme/prod/other-agent"), "/path", &[]).await;
+
+        assert_rejection(response, StatusCode::FORBIDDEN).await;
+    }
+
+    #[tokio::test]
+    async fn handle_returns_400_for_a_path_that_is_not_valid() {
+        let response = call_as(Some(PAYMENT_AGENT), "/path/%2e%2e/other", &[]).await;
+
+        assert_rejection(response, StatusCode::BAD_REQUEST).await;
     }
 
     #[tokio::test]
