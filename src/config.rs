@@ -14,6 +14,12 @@ pub enum ConfigError {
     /// The environment variable is set, but its value is empty.
     #[error("environment variable {0} is empty")]
     Empty(&'static str),
+    /// `SERVER_ADDR` and `PROXY_ADDR` are the same address. The proxy would send
+    /// every request to itself.
+    #[error(
+        "SERVER_ADDR and PROXY_ADDR are the same address ({0}): the proxy would send its requests to itself"
+    )]
+    UpstreamIsProxy(String),
 }
 
 /// The configuration of the program. Make it once, at start.
@@ -99,6 +105,18 @@ impl Config {
     /// The address (`host:port`) of the `server` mode.
     pub fn server_addr(&self) -> &str {
         &self.server_addr
+    }
+
+    /// Return an error if `SERVER_ADDR` is the same text as `PROXY_ADDR`.
+    ///
+    /// This is a check of the text only. It does not know that `localhost:8080`
+    /// and `127.0.0.1:8080` are the same address. The `Via` header catches a
+    /// loop that this check does not see.
+    pub fn check_upstream_is_not_proxy(&self) -> Result<(), ConfigError> {
+        if self.server_addr == self.proxy_addr {
+            return Err(ConfigError::UpstreamIsProxy(self.proxy_addr.clone()));
+        }
+        Ok(())
     }
 
     /// The paths of the certificate file and the key file, in this order.
@@ -317,6 +335,24 @@ mod tests {
         assert!(matches!(
             config.client_ca(),
             Err(ConfigError::NotSet("PROXY_CLIENT_CA"))
+        ));
+    }
+
+    #[test]
+    fn check_upstream_is_not_proxy_accepts_different_addresses() {
+        let config = config(None, None);
+
+        assert!(config.check_upstream_is_not_proxy().is_ok());
+    }
+
+    #[test]
+    fn check_upstream_is_not_proxy_fails_for_the_same_address() {
+        let mut config = config(None, None);
+        config.server_addr = config.proxy_addr.clone();
+
+        assert!(matches!(
+            config.check_upstream_is_not_proxy(),
+            Err(ConfigError::UpstreamIsProxy(_))
         ));
     }
 

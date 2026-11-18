@@ -34,6 +34,7 @@ The allowlist (`ALLOWED_REQUEST` in `src/headers.rs`):
 | `Content-Type`, `Content-Encoding`, `Content-Length` | The description of the body. |
 | `Cache-Control`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `Range` | Conditional and partial requests. |
 | `User-Agent` | Helps the upstream to diagnose a problem. |
+| `Via` | The chain of proxies. The proxy keeps the values and adds its own (see below). It needs the chain to find a loop. |
 | `X-Request-Id` | Kept if it is valid (1 to 128 characters: letters, digits, `-`, `_`, `.`, `:`). Otherwise replaced with a new UUID. |
 
 The proxy sets these headers itself (it always removes the values from the
@@ -45,7 +46,7 @@ client):
 | `X-Forwarded-For` | The IP address of the client connection. The proxy does not add to a value from the client, because it does not trust it. |
 | `X-Forwarded-Proto` | Always `https`, because every client connection uses TLS. |
 | `X-Forwarded-Host` | The `Host` header of the client request, or the authority of the URI (HTTP/2). Not set if there is neither. |
-| `Via` | The HTTP version of the client request and the name `reverse-proxy`, for example `1.1 reverse-proxy`. |
+| `Via` | The proxy adds one value after the values that the request has: the HTTP version of the client request and its own name, for example `1.1 reverse-proxy-1a2b3c4d`. |
 
 The proxy also removes the hop-by-hop headers (`Connection`, `Keep-Alive`,
 `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
@@ -53,12 +54,39 @@ The proxy also removes the hop-by-hop headers (`Connection`, `Keep-Alive`,
 names. The allowlist has none of them, but the proxy removes them first, so a
 future change to the list cannot let one through.
 
+The proxy name is `reverse-proxy-` and 8 random hexadecimal digits. Each start
+of the proxy makes a new name. A request that comes back to the same proxy has
+its name in `Via`. A request from another proxy of this program has a different
+name, so it is not a loop.
+
 The standard `Forwarded` header is removed and is not set. We set the
 `X-Forwarded-*` headers only.
 
 The proxy also changes the request line: the method, the path and the query
 stay as they are, and the request goes to the upstream as HTTP/1.1, also when
 the client used HTTP/2.
+
+### Loops
+
+A proxy loop is a request that comes back to the proxy that already sent it on.
+The proxy looks for its own name in the `Via` header of each request, before
+it adds its name. If it finds the name, the proxy:
+
+- answers `508 Loop Detected` with an empty body;
+- does not send the request to the upstream;
+- writes an audit event with `decision` `DENY` and `reason` `loop`.
+
+The check comes after the identity check (`401`) and before the path check
+(`400`) and the policy check (`403`).
+
+The proxy also stops at start (exit code 1) if `SERVER_ADDR` and `PROXY_ADDR`
+are the same text. The check does not know that `localhost:8080` and
+`127.0.0.1:8080` are the same address.
+
+A client can put any `Via` value in a request. It cannot cause a `508` for
+another client, because the name is random and the proxy never sends it to a
+client. A client that sends the name of the proxy only makes its own request
+fail.
 
 ### Response, from the upstream to the client
 
@@ -92,8 +120,14 @@ that the proxy forwards. See `src/audit.rs`.
   about security, for example to build a link in a password reset message.
 - A new header in a future HTTP standard is not forwarded until we add it. This
   is the safe direction.
-- The proxy does not stop a loop yet. A request that the proxy sends to itself
-  gets a new `Via` value, and nothing counts the hops. This is a known gap.
+- The proxy stops a loop only if every proxy in the loop keeps the `Via`
+  header and adds to it. A hop that removes `Via` hides the loop. Nothing counts
+  the hops, so a loop that passes through such a hop is not found.
+- A direct loop (`SERVER_ADDR` is the proxy) already fails by itself: the proxy
+  sends plain HTTP, and its own port needs TLS, so the handshake fails and the
+  client gets `502`. The `Via` check matters when a hop in the loop ends TLS.
+- The proxy keeps the `Via` values of the client and sends them to the upstream.
+  The upstream must not trust them.
 - The response is not filtered with a list. An upstream can send any
   end-to-end header to the client.
 
@@ -108,6 +142,15 @@ that the proxy forwards. See `src/audit.rs`.
 - **Append to `X-Forwarded-For`, as many proxies do.** This keeps the chain of
   addresses, but the client controls the first values. The proxy is the first
   hop and has no trusted proxy in front of it, so a chain has no value here.
+- **Replace `Via` with one value, as the first version did.** The proxy then
+  never sees its own name in a chain, so it cannot find a loop through another
+  proxy.
+- **Count hops with `Max-Forwards` or a hop counter header.** It stops all
+  loops, but it needs a limit that is right for each setup, and a client can
+  reset a header that the proxy does not control. We can add it later.
+- **A fixed proxy name (`reverse-proxy`).** Another proxy of this program, which
+  is a legal hop, would then look like a loop. A random name for each start
+  avoids this.
 - **Set the standard `Forwarded` header.** It carries the same data in a
   better format. Many upstreams read only `X-Forwarded-*`, so we kept those.
   We can add `Forwarded` later.

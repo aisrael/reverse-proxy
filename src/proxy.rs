@@ -171,6 +171,8 @@ fn client_identity(connection: &ServerConnection, peer: SocketAddr) -> Option<Id
 /// and does not connect to the upstream if:
 ///
 /// - the client has no valid identity: `401`;
+/// - the request has the name of this proxy in its `Via` header, so it came
+///   back to this proxy (a loop): `508`;
 /// - the path is not valid (see `policy::is_valid_path`): `400`;
 /// - the policy does not allow the identity to send this method and path: `403`.
 ///
@@ -203,7 +205,9 @@ where
         .get(HOST)
         .and_then(|host| host.to_str().ok())
         .map(str::to_string);
-    let prepared = prepare_request(&mut request, &state.upstream, client_ip);
+    // Check this before `prepare_request`, which adds the name of this proxy.
+    let is_loop = headers::via_has(request.headers(), &state.via_name);
+    let prepared = prepare_request(&mut request, &state.upstream, client_ip, &state.via_name);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
     let request_id = headers::ensure_request_id(request.headers_mut());
@@ -212,6 +216,10 @@ where
         None => (
             empty(StatusCode::UNAUTHORIZED),
             Decision::Deny(Reason::NoIdentity),
+        ),
+        Some(_) if is_loop => (
+            empty(StatusCode::LOOP_DETECTED),
+            Decision::Deny(Reason::Loop),
         ),
         Some(_) if !policy::is_valid_path(&path) => (
             empty(StatusCode::BAD_REQUEST),
@@ -263,7 +271,7 @@ where
 /// - Send the request to the upstream, as HTTP/1.
 /// - Remove the hop-by-hop headers.
 /// - Remove each request header that is not on the list of allowed headers.
-/// - Replace the forwarding headers (`X-Forwarded-*`, `Via`).
+/// - Replace the forwarding headers (`X-Forwarded-*`), and add `via_name` to `Via`.
 /// - Set `Host` to the address of the upstream.
 ///
 /// Keep the headers on the list of allowed headers.
@@ -272,6 +280,7 @@ fn prepare_request<B>(
     request: &mut Request<B>,
     upstream: &str,
     client_ip: IpAddr,
+    via_name: &str,
 ) -> Result<(), InvalidUri> {
     // The host that the client asked for. An HTTP/2 request has no `Host`
     // header, but its URI has the authority.
@@ -301,6 +310,7 @@ fn prepare_request<B>(
         // Every client connection uses TLS.
         "https",
         client_version,
+        via_name,
     );
     headers::set_host(request_headers, upstream);
     Ok(())
@@ -429,6 +439,33 @@ mod tests {
         let response = call_as(Some("spiffe://acme/prod/other-agent"), "/path", &[]).await;
 
         assert_rejection(response, StatusCode::FORBIDDEN).await;
+    }
+
+    #[tokio::test]
+    async fn handle_returns_508_for_a_request_that_has_the_name_of_the_proxy_in_via() {
+        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM, policies()));
+        let via = format!("1.1 other, 1.1 {}", state.via_name);
+        let request = Request::builder()
+            .uri("/path")
+            .header("via", via)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let identity = Some(PAYMENT_AGENT.parse::<Identity>().unwrap());
+
+        let response = match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+
+        assert_rejection(response, StatusCode::LOOP_DETECTED).await;
+    }
+
+    #[tokio::test]
+    async fn handle_does_not_stop_a_request_that_has_the_name_of_another_proxy_in_via() {
+        let response = call(&[("via", "1.1 reverse-proxy-00000000")]).await;
+
+        // The upstream address is not valid in this test, so the answer is 502.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

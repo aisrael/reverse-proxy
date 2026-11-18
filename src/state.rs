@@ -1,5 +1,6 @@
 //! The state that the proxy shares between all requests.
 
+use crate::headers;
 use crate::policy::Policies;
 use hyper::body::Body;
 use hyper::body::Incoming;
@@ -22,6 +23,9 @@ pub struct AppState<B = Incoming> {
     pub upstream: String,
     /// Which identity may send which requests.
     pub policies: Policies,
+    /// The name of this proxy in the `Via` header. It is different for each
+    /// start. A request with this name in its `Via` header is a loop.
+    pub via_name: String,
 }
 
 impl<B> AppState<B>
@@ -35,6 +39,7 @@ where
             client: Client::builder(TokioExecutor::new()).build_http(),
             upstream: upstream.to_string(),
             policies,
+            via_name: headers::new_via_name(),
         }
     }
 }

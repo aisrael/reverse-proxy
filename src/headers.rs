@@ -7,9 +7,11 @@ use hyper::header::CONNECTION;
 use hyper::header::HOST;
 use hyper::header::HeaderName;
 use hyper::header::HeaderValue;
+use hyper::header::VIA;
 use std::net::IpAddr;
 
-/// The name that the proxy gives itself in the `Via` header.
+/// The start of the name that the proxy gives itself in the `Via` header. Each
+/// proxy adds a random part (see `new_via_name`).
 const PROXY_NAME: &str = "reverse-proxy";
 
 /// The header that carries the request ID.
@@ -36,7 +38,7 @@ const HOP_BY_HOP: [&str; 8] = [
 ///
 /// `Authorization` and `Cookie` are not on the list. The proxy decides from the
 /// client certificate, and the upstream does not need these headers.
-const ALLOWED_REQUEST: [&str; 14] = [
+const ALLOWED_REQUEST: [&str; 15] = [
     "accept",
     "accept-encoding",
     "accept-language",
@@ -50,17 +52,18 @@ const ALLOWED_REQUEST: [&str; 14] = [
     "if-unmodified-since",
     "range",
     "user-agent",
+    "via",
     REQUEST_ID,
 ];
 
 /// Headers that tell the upstream about the client and the proxy. The proxy
 /// sets them itself, and it does not trust the values from a client.
-const FORWARDING: [&str; 5] = [
+/// `Via` is not here: the proxy keeps it and adds to it (see `set_forwarding`).
+const FORWARDING: [&str; 4] = [
     "x-forwarded-for",
     "x-forwarded-proto",
     "x-forwarded-host",
     "forwarded",
-    "via",
 ];
 
 /// Remove the hop-by-hop headers. Also remove every header that a `Connection`
@@ -93,6 +96,29 @@ pub fn retain_allowed_request(headers: &mut HeaderMap) {
     }
 }
 
+/// Make a name for one proxy in the `Via` header: `reverse-proxy-` and 8 random
+/// hexadecimal digits. Each start of the proxy makes a new name. A request that
+/// comes back to the same proxy has this name in its `Via` header, and a request
+/// that comes from another proxy of this program does not.
+pub fn new_via_name() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("{PROXY_NAME}-{}", &id[..8])
+}
+
+/// True if a `Via` header of `headers` has the proxy `name`.
+///
+/// A `Via` value is a list. Each item is the protocol, a space, and the name of
+/// a proxy (`1.1 reverse-proxy-1a2b3c4d`). A comment can follow.
+pub fn via_has(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all(VIA)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|item| item.split_whitespace().nth(1))
+        .any(|received_by| received_by == name)
+}
+
 /// Replace the forwarding headers of a request.
 ///
 /// First remove the values that the client sent. Then set:
@@ -101,13 +127,17 @@ pub fn retain_allowed_request(headers: &mut HeaderMap) {
 /// - `X-Forwarded-Host`: `original_host`, the host that the client asked for.
 ///   Do not set it if there is no original host.
 /// - `X-Forwarded-Proto`: `proto`, the protocol of the client connection.
-/// - `Via`: the HTTP version of the client request, and the name of the proxy.
+///
+/// Keep the `Via` values that the request has, and add one value: the HTTP
+/// version of the client request, and `via_name`, the name of the proxy. The
+/// chain of names lets a proxy see that a request came back to it (a loop).
 pub fn set_forwarding(
     headers: &mut HeaderMap,
     client_ip: IpAddr,
     original_host: Option<&HeaderValue>,
     proto: &'static str,
     version: Version,
+    via_name: &str,
 ) {
     for name in FORWARDING {
         headers.remove(name);
@@ -117,11 +147,9 @@ pub fn set_forwarding(
         headers.insert("x-forwarded-host", host.clone());
     }
     headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
-    insert(
-        headers,
-        "via",
-        &format!("{} {PROXY_NAME}", via_protocol(version)),
-    );
+    if let Ok(value) = HeaderValue::from_str(&format!("{} {via_name}", via_protocol(version))) {
+        headers.append(VIA, value);
+    }
 }
 
 /// Set `Host` to the address of the upstream (`host:port`).
@@ -244,6 +272,7 @@ mod tests {
             ("content-length", "5"),
             ("user-agent", "test"),
             ("x-request-id", "id-1"),
+            ("via", "1.1 other"),
             ("authorization", "Bearer abc"),
             ("cookie", "a=b"),
             ("x-custom", "yes"),
@@ -261,6 +290,7 @@ mod tests {
                 "content-length",
                 "content-type",
                 "user-agent",
+                "via",
                 "x-request-id"
             ]
         );
@@ -286,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn set_forwarding_replaces_the_values_from_the_client() {
+    fn set_forwarding_replaces_the_values_from_the_client_and_adds_to_via() {
         let mut map = headers(&[
             ("x-forwarded-for", "1.2.3.4"),
             ("x-forwarded-proto", "https"),
@@ -302,13 +332,19 @@ mod tests {
             Some(&host),
             "http",
             Version::HTTP_11,
+            "reverse-proxy-1a2b3c4d",
         );
 
         assert_eq!(map.get_all("x-forwarded-for").iter().count(), 1);
         assert_eq!(map["x-forwarded-for"], "192.0.2.7");
         assert_eq!(map["x-forwarded-proto"], "http");
         assert_eq!(map["x-forwarded-host"], "proxy.example:8080");
-        assert_eq!(map["via"], "1.1 reverse-proxy");
+        let via: Vec<&str> = map
+            .get_all("via")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(via, ["1.1 other", "1.1 reverse-proxy-1a2b3c4d"]);
         assert!(!map.contains_key("forwarded"));
     }
 
@@ -322,11 +358,43 @@ mod tests {
             None,
             "http",
             Version::HTTP_2,
+            "reverse-proxy-1a2b3c4d",
         );
 
         assert!(!map.contains_key("x-forwarded-host"));
         assert_eq!(map["x-forwarded-for"], "2001:db8::1");
-        assert_eq!(map["via"], "2 reverse-proxy");
+        assert_eq!(map["via"], "2 reverse-proxy-1a2b3c4d");
+    }
+
+    #[test]
+    fn new_via_name_is_different_each_time() {
+        let name = new_via_name();
+
+        assert!(name.starts_with("reverse-proxy-"), "{name}");
+        assert_eq!(name.len(), "reverse-proxy-".len() + 8);
+        assert_ne!(name, new_via_name());
+    }
+
+    #[test]
+    fn via_has_finds_the_name_in_any_item() {
+        let map = headers(&[
+            ("via", "1.0 fred, 1.1 reverse-proxy-1a2b3c4d (comment)"),
+            ("via", "2 other"),
+        ]);
+
+        assert!(via_has(&map, "reverse-proxy-1a2b3c4d"));
+        assert!(via_has(&map, "other"));
+    }
+
+    #[test]
+    fn via_has_does_not_find_another_name() {
+        let map = headers(&[
+            ("via", "1.1 reverse-proxy-ffffffff"),
+            ("via", "1.1 xreverse-proxy-1a2b3c4d, 1.1"),
+        ]);
+
+        assert!(!via_has(&map, "reverse-proxy-1a2b3c4d"));
+        assert!(!via_has(&HeaderMap::new(), "reverse-proxy-1a2b3c4d"));
     }
 
     #[test]

@@ -18,8 +18,9 @@ set must not be empty.
 | `RUST_LOG`       | `info`           | both     | The log level of the logs on STDERR, for example `debug`. It does not change the audit events. |
 
 The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT`,
-`PROXY_TLS_KEY`, `PROXY_CLIENT_CA` or `PROXY_POLICY_FILE` is not set, or if a
-file cannot be read or is not valid.
+`PROXY_TLS_KEY`, `PROXY_CLIENT_CA` or `PROXY_POLICY_FILE` is not set, if a
+file cannot be read or is not valid, or if `SERVER_ADDR` is the same text as
+`PROXY_ADDR`.
 The `server` mode does not use the TLS variables.
 
 The `proxy` mode requires a client certificate (mTLS). A client without a
@@ -53,6 +54,7 @@ upstream, in these cases:
 | `401`  | The client certificate has no valid identity.                   |
 | `400`  | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, `%00`, NUL. |
 | `403`  | The policy does not allow this identity to send this request.   |
+| `508`  | The request came back to this proxy (a loop). See "Headers".    |
 
 The proxy does not decode `%` sequences in the path. See
 `docs/adrs/001-no-percent-decoding-in-path-policy.md`.
@@ -62,11 +64,14 @@ The proxy does not decode `%` sequences in the path. See
 The proxy sends only some request headers to the upstream: `Accept`,
 `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Encoding`,
 `Content-Length`, `Content-Type`, `If-Match`, `If-Modified-Since`,
-`If-None-Match`, `If-Unmodified-Since`, `Range`, `User-Agent` and
+`If-None-Match`, `If-Unmodified-Since`, `Range`, `User-Agent`, `Via` and
 `X-Request-Id`. It removes all other request headers, for example
 `Authorization`, `Cookie` and custom headers. It sets `Host`,
-`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `Via` itself,
-and ignores the values that the client sent for them. For a response, it
+`X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself, and
+ignores the values that the client sent for them. It keeps `Via` and adds its
+own name (`reverse-proxy-` and 8 random digits, new at each start). If a request
+already has this name in `Via`, it came back to the proxy: the proxy answers
+`508` and does not forward it. For a response, it
 removes the hop-by-hop headers (`Connection`, `Transfer-Encoding` and others)
 and forwards the rest. The list is `ALLOWED_REQUEST` in `src/headers.rs`. See
 `docs/adrs/002-headers-the-proxy-forwards.md`.
@@ -89,7 +94,7 @@ change the audit events.
 | `method`, `path`  | The method and the path. The query is never in the event.        |
 | `host`            | The `Host` header, as the client sent it. Not present if none.   |
 | `decision`        | `ALLOW` (sent to the upstream) or `DENY`.                        |
-| `reason`          | Only for `DENY`: `no_identity`, `invalid_path` or `policy`.      |
+| `reason`          | Only for `DENY`: `no_identity`, `invalid_path`, `policy` or `loop`. |
 | `status`          | The status that the client got.                                  |
 | `upstream_status` | The status from the upstream. Not present if the proxy did not get a response from it (a `DENY`, or a `502`). |
 | `latency_ms`      | The time from the request to the response head, in milliseconds. |

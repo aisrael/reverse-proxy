@@ -50,6 +50,7 @@ async fn main() -> Result<(), Error> {
     match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {
             // Check the TLS setup and the policy before the bind. A wrong setup stops the proxy at once.
+            config.check_upstream_is_not_proxy()?;
             let (cert_path, key_path) = config.tls_paths()?;
             let client_ca_path = config.client_ca()?;
             let tls_config = tls::server_config(cert_path, key_path, client_ca_path)?;

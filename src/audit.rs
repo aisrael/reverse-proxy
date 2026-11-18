@@ -24,6 +24,8 @@ pub enum Reason {
     InvalidPath,
     /// The policy does not allow this identity to send this request (`403`).
     Policy,
+    /// The request came back to this proxy (`508`).
+    Loop,
 }
 
 impl Decision {
@@ -42,6 +44,7 @@ impl Decision {
             Decision::Deny(Reason::NoIdentity) => Some("no_identity"),
             Decision::Deny(Reason::InvalidPath) => Some("invalid_path"),
             Decision::Deny(Reason::Policy) => Some("policy"),
+            Decision::Deny(Reason::Loop) => Some("loop"),
         }
     }
 }

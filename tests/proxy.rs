@@ -488,7 +488,15 @@ async fn replaces_the_forwarding_headers_and_the_host() {
     assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
     assert_eq!(headers["x-forwarded-proto"], "https");
     assert_eq!(headers["x-forwarded-host"], PROXY_ADDR);
-    assert_eq!(headers["via"], "1.1 reverse-proxy");
+    // The proxy keeps the `Via` value of the client and adds its own.
+    let via: Vec<&str> = headers
+        .get_all("via")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(via.len(), 2, "{via:?}");
+    assert_eq!(via[0], "1.1 other");
+    assert!(via[1].starts_with("1.1 reverse-proxy-"), "{via:?}");
     assert!(!headers.contains_key("forwarded"));
     assert_eq!(headers["host"], SERVER_ADDR);
 }
@@ -899,6 +907,81 @@ async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
 
     let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn answers_508_and_does_not_forward_a_request_that_came_back_to_the_proxy() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The `server` mode sends the request headers back. The response shows the
+    // `Via` value that the proxy added. A proxy that gets a request with this
+    // value has seen the request before.
+    let (status, headers, _) = send(&client(), Method::GET, "/echo", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let via = headers["via"].to_str().unwrap().to_string();
+
+    let (status, _, body) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[
+            ("via", &format!("1.1 other, {via}")),
+            ("x-request-id", "loop-1"),
+        ],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::LOOP_DETECTED);
+    assert!(body.is_empty());
+    let events = proxy.audit_events();
+    let event = events.last().expect("no audit event");
+    assert_eq!(event["request_id"], "loop-1");
+    assert_eq!(event["decision"], "DENY");
+    assert_eq!(event["reason"], "loop");
+    assert_eq!(event["status"], 508);
+    assert!(event.get("upstream_status").is_none(), "{event}");
+}
+
+#[tokio::test]
+#[serial]
+async fn does_not_stop_a_request_that_has_the_name_of_another_proxy() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let (status, _, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[("via", "1.1 reverse-proxy-00000000")],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn exits_with_code_1_when_the_upstream_is_the_proxy() {
+    // The program must stop before it binds, so it needs no free port.
+    let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
+        .arg("proxy")
+        .env("PROXY_ADDR", PROXY_ADDR)
+        .env("SERVER_ADDR", PROXY_ADDR)
+        .env("PROXY_TLS_CERT", CERT_PATH)
+        .env("PROXY_TLS_KEY", KEY_PATH)
+        .env("PROXY_CLIENT_CA", CA_PATH)
+        .env("PROXY_POLICY_FILE", POLICY_PATH)
+        .output()
+        .expect("failed to run the program");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    // `main` prints the error in Debug format, so the text is the variant name.
+    assert!(stderr.contains("UpstreamIsProxy"), "{stderr}");
 }
 
 #[tokio::test]
