@@ -1,8 +1,11 @@
 //! Black-box tests for the `proxy` mode.
 //!
 //! The tests start the compiled program as child processes: the `server` mode
-//! (the upstream) and the `proxy` mode. They talk to the proxy over HTTP only.
+//! (the upstream) and the `proxy` mode. They talk to the proxy over HTTPS only.
 //! They use no types or functions from the program code.
+//!
+//! The proxy needs the dev certificates. Make them first, with
+//! `./scripts/gen-dev-certs.sh`.
 //!
 //! The program listens on fixed addresses, so only one copy of each mode can
 //! run at a time. The tests use `#[serial]`, so they run one after the other.
@@ -15,9 +18,13 @@ use hyper::HeaderMap;
 use hyper::Method;
 use hyper::Request;
 use hyper::StatusCode;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper::header::HOST;
+use hyper_util::rt::TokioIo;
+use rustls::ClientConfig;
+use rustls::RootCertStore;
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::ServerName;
+use rustls_pki_types::pem::PemObject;
 use serial_test::serial;
 use std::fs::File;
 use std::net::TcpStream;
@@ -26,15 +33,27 @@ use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 
 /// The address of the `proxy` mode.
 const PROXY_ADDR: &str = "127.0.0.1:8080";
 
 /// The address of the `server` mode (the upstream).
 const SERVER_ADDR: &str = "127.0.0.1:9000";
+
+/// The certificate of the dev CA. The proxy uses a certificate that this CA signed.
+const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/ca.pem");
+
+/// The certificate and the key of the proxy.
+const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.pem");
+const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.key");
 
 /// A running copy of the program. The process stops when this value is dropped.
 struct Program {
@@ -69,6 +88,8 @@ impl Program {
             // from `.envrc`) cannot change them.
             .env("PROXY_ADDR", PROXY_ADDR)
             .env("SERVER_ADDR", SERVER_ADDR)
+            .env("PROXY_TLS_CERT", CERT_PATH)
+            .env("PROXY_TLS_KEY", KEY_PATH)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -147,10 +168,47 @@ impl Drop for Program {
     }
 }
 
-type TestClient = Client<HttpConnector, Full<Bytes>>;
+/// A client that trusts the dev CA. It opens a new connection for each request.
+struct TestClient {
+    connector: TlsConnector,
+}
 
 fn client() -> TestClient {
-    Client::builder(TokioExecutor::new()).build_http()
+    TestClient {
+        connector: tls_connector(&[b"http/1.1"]),
+    }
+}
+
+/// Make a TLS connector that trusts the dev CA and offers `alpn` protocols.
+fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
+    let mut roots = RootCertStore::empty();
+    let certs = CertificateDer::pem_file_iter(CA_PATH)
+        .expect("cannot read the CA. Run ./scripts/gen-dev-certs.sh first");
+    for cert in certs {
+        roots
+            .add(cert.expect("the CA file is not valid"))
+            .expect("the CA certificate is not valid");
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("invalid protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
+    TlsConnector::from(Arc::new(config))
+}
+
+/// Open a TLS connection to the proxy. The certificate is for `localhost`.
+async fn connect(connector: &TlsConnector) -> TlsStream<tokio::net::TcpStream> {
+    let tcp = tokio::net::TcpStream::connect(PROXY_ADDR)
+        .await
+        .expect("failed to connect to the proxy");
+    let name = ServerName::try_from("localhost").expect("not a valid name");
+    connector
+        .connect(name, tcp)
+        .await
+        .expect("the TLS handshake failed")
 }
 
 /// Send a request to the proxy. Return the status, the headers and the body.
@@ -161,16 +219,26 @@ async fn send(
     headers: &[(&str, &str)],
     body: impl Into<Bytes>,
 ) -> (StatusCode, HeaderMap, Bytes) {
+    let stream = connect(&client.connector).await;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("the HTTP handshake failed");
+    tokio::spawn(connection);
+
     let mut request = Request::builder()
         .method(method)
-        .uri(format!("http://{PROXY_ADDR}{path}"));
+        .uri(path)
+        .header(HOST, PROXY_ADDR);
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
     let request = request
         .body(Full::new(body.into()))
         .expect("failed to build the request");
-    let response = client.request(request).await.expect("the request failed");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("the request failed");
     let (parts, body) = response.into_parts();
     let body = body
         .collect()
@@ -274,7 +342,7 @@ async fn replaces_the_forwarding_headers_and_the_host() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get_all("x-forwarded-for").iter().count(), 1);
     assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
-    assert_eq!(headers["x-forwarded-proto"], "http");
+    assert_eq!(headers["x-forwarded-proto"], "https");
     assert_eq!(headers["x-forwarded-host"], PROXY_ADDR);
     assert_eq!(headers["via"], "1.1 reverse-proxy");
     assert!(!headers.contains_key("forwarded"));
@@ -425,4 +493,41 @@ async fn ctrl_c_stops_the_proxy_with_exit_code_0() {
     let status = proxy.wait_for_exit(Duration::from_secs(5)).await;
     assert_eq!(status.code(), Some(0), "{}", proxy.stderr());
     proxy.assert_not_listening();
+}
+
+#[tokio::test]
+#[serial]
+async fn negotiates_h2_and_http_1_1_with_alpn() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    for (offered, chosen) in [(&b"h2"[..], &b"h2"[..]), (b"http/1.1", b"http/1.1")] {
+        let stream = connect(&tls_connector(&[offered])).await;
+
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(chosen));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let mut plain = tokio::net::TcpStream::connect(PROXY_ADDR).await.unwrap();
+    plain
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    // The proxy closes the connection. It does not send an HTTP response.
+    // A TLS alert is allowed, and the read can fail with a reset.
+    let mut reply = Vec::new();
+    let _ = plain.read_to_end(&mut reply).await;
+    assert!(
+        !reply.starts_with(b"HTTP/"),
+        "got an HTTP response on the TLS port"
+    );
+
+    let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
 }
