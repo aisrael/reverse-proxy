@@ -10,3 +10,11 @@ export PROXY_ADDR="127.0.0.1:8080"
 # The address (`host:port`) of the `server` mode. The proxy sends its requests to
 # this address. The default is `127.0.0.1:9000`.
 export SERVER_ADDR="127.0.0.1:9000"
+
+# The path of the certificate file (PEM) for the `proxy` mode. The proxy needs
+# it to accept HTTPS. There is no default. Make the dev files with
+# `./scripts/gen-dev-certs.sh`.
+export PROXY_TLS_CERT="dev-certs/server.pem"
+
+# The path of the private key file (PEM) for the certificate. There is no default.
+export PROXY_TLS_KEY="dev-certs/server.key"
