@@ -2,6 +2,10 @@
 //!
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
+use crate::audit;
+use crate::audit::Decision;
+use crate::audit::Event;
+use crate::audit::Reason;
 use crate::headers;
 use crate::identity::Identity;
 use crate::policy;
@@ -189,40 +193,61 @@ where
     B::Error: Into<Box<dyn Error + Send + Sync>>,
 {
     let started = Instant::now();
-    // Keep the method and the path for the log line. Never log the query.
+    // Keep these for the audit event. Never keep the query.
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let identity = identity.map(|identity| identity.to_string());
+    // Read the host before `prepare_request`, which sets `Host` to the upstream.
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|host| host.to_str().ok())
+        .map(str::to_string);
     let prepared = prepare_request(&mut request, &state.upstream, client_ip);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
     let request_id = headers::ensure_request_id(request.headers_mut());
-    let mut response = match &identity {
-        None => empty(StatusCode::UNAUTHORIZED),
-        Some(_) if !policy::is_valid_path(&path) => empty(StatusCode::BAD_REQUEST),
-        Some(identity)
-            if !state
-                .policies
-                .authorize(&identity.to_string(), &method, &path) =>
-        {
-            empty(StatusCode::FORBIDDEN)
+    let mut upstream_status = None;
+    let (mut response, decision) = match &identity {
+        None => (
+            empty(StatusCode::UNAUTHORIZED),
+            Decision::Deny(Reason::NoIdentity),
+        ),
+        Some(_) if !policy::is_valid_path(&path) => (
+            empty(StatusCode::BAD_REQUEST),
+            Decision::Deny(Reason::InvalidPath),
+        ),
+        Some(identity) if !state.policies.authorize(identity, &method, &path) => {
+            (empty(StatusCode::FORBIDDEN), Decision::Deny(Reason::Policy))
         }
-        Some(_) => match prepared {
-            Ok(()) => forward(&state, request).await,
-            Err(err) => {
-                warn!(%err, "cannot make the upstream URI");
-                bad_gateway()
-            }
-        },
+        Some(_) => {
+            let response = match prepared {
+                Ok(()) => match forward(&state, request).await {
+                    Some(response) => {
+                        upstream_status = Some(response.status().as_u16());
+                        response
+                    }
+                    None => bad_gateway(),
+                },
+                Err(err) => {
+                    warn!(%err, "cannot make the upstream URI");
+                    bad_gateway()
+                }
+            };
+            (response, Decision::Allow)
+        }
     };
-    debug!(
-        %method,
-        %path,
-        identity = ?identity.as_ref().map(Identity::to_string),
-        status = response.status().as_u16(),
-        latency_ms = started.elapsed().as_millis() as u64,
-        request_id = request_id.to_str().unwrap_or_default(),
-        "request done"
-    );
+    audit::record(&Event {
+        request_id: request_id.to_str().unwrap_or_default(),
+        identity: identity.as_deref(),
+        method: &method,
+        path: &path,
+        host: host.as_deref(),
+        decision,
+        status: response.status().as_u16(),
+        upstream_status,
+        latency_ms: started.elapsed().as_millis() as u64,
+    });
     response
         .headers_mut()
         .insert(headers::REQUEST_ID, request_id);
@@ -281,8 +306,8 @@ fn prepare_request<B>(
 
 /// Send the prepared `request` to the upstream and return the response, with
 /// the hop-by-hop headers removed. Stream the body of the response.
-/// If the upstream fails, return `502 Bad Gateway`.
-async fn forward<B>(state: &AppState<B>, request: Request<B>) -> Response<Body>
+/// If the upstream fails, log the error and return `None`.
+async fn forward<B>(state: &AppState<B>, request: Request<B>) -> Option<Response<Body>>
 where
     B: RequestBody + Send + Unpin + 'static,
     B::Data: Send,
@@ -292,11 +317,11 @@ where
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             headers::remove_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, body.boxed_unsync())
+            Some(Response::from_parts(parts, body.boxed_unsync()))
         }
         Err(err) => {
             warn!(%err, "request to the upstream failed");
-            bad_gateway()
+            None
         }
     }
 }
