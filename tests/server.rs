@@ -4,8 +4,8 @@
 //! over HTTP only. They use no types or functions from the server code.
 //!
 //! The server listens on a fixed address, so only one copy can run at a time.
-//! The tests wait for each other. Stop any other copy of the server before you
-//! run the tests.
+//! The tests use `#[serial]`, so they run one after the other. Stop any other
+//! copy of the server before you run the tests.
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -13,6 +13,7 @@ use http_body_util::Empty;
 use hyper::StatusCode;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use serial_test::serial;
 use std::fs::File;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -22,15 +23,10 @@ use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
 use tokio::time::sleep;
 
 /// The address that the server listens on.
 const ADDR: &str = "127.0.0.1:8080";
-
-/// Only one test can use the address at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
 
 /// A running server. The process stops when this value is dropped.
 struct Server {
@@ -38,7 +34,6 @@ struct Server {
     /// The file that holds the STDERR of the server. The file is read only if
     /// the server fails to start.
     stderr_path: PathBuf,
-    _serial: MutexGuard<'static, ()>,
 }
 
 impl Server {
@@ -48,7 +43,6 @@ impl Server {
     /// startup. Panic with the STDERR too if the server does not accept
     /// connections within 10 seconds.
     async fn start() -> Self {
-        let serial = SERIAL.lock().await;
         assert!(
             TcpStream::connect(ADDR).is_err(),
             "another process uses {ADDR}. Stop it and run the tests again"
@@ -62,11 +56,7 @@ impl Server {
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("failed to start the server");
-        let mut server = Server {
-            child,
-            stderr_path,
-            _serial: serial,
-        };
+        let mut server = Server { child, stderr_path };
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while TcpStream::connect(ADDR).is_err() {
@@ -128,6 +118,7 @@ impl Drop for Server {
 }
 
 #[tokio::test]
+#[serial]
 async fn get_returns_ok_with_a_fixed_body() {
     let _server = Server::start().await;
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
@@ -143,6 +134,7 @@ async fn get_returns_ok_with_a_fixed_body() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ctrl_c_stops_the_server_with_exit_code_0() {
     let mut server = Server::start().await;
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
