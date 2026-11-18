@@ -385,15 +385,44 @@ async fn forwards_the_request_headers() {
         &client(),
         Method::GET,
         "/echo?x=1",
-        &[("x-test", "one"), ("x-other", "two")],
+        &[("accept-language", "en"), ("user-agent", "test-agent")],
         "",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["x-test"], "one");
-    assert_eq!(headers["x-other"], "two");
+    assert_eq!(headers["accept-language"], "en");
+    assert_eq!(headers["user-agent"], "test-agent");
     assert!(body.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn does_not_forward_a_header_that_is_not_on_the_list() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The `server` mode sends the request headers back, so the response shows
+    // what the upstream received.
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[
+            ("authorization", "Bearer abc"),
+            ("cookie", "session=abc"),
+            ("x-custom", "yes"),
+            ("accept", "text/plain"),
+        ],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("authorization"));
+    assert!(!headers.contains_key("cookie"));
+    assert!(!headers.contains_key("x-custom"));
+    assert_eq!(headers["accept"], "text/plain");
 }
 
 #[tokio::test]
@@ -406,13 +435,13 @@ async fn forwards_the_request_body() {
         &client(),
         Method::POST,
         "/echo",
-        &[("x-test", "one")],
+        &[("content-type", "text/plain")],
         "hello",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["x-test"], "one");
+    assert_eq!(headers["content-type"], "text/plain");
     assert_eq!(&body[..], b"hello");
 }
 
@@ -481,7 +510,7 @@ async fn removes_the_hop_by_hop_headers() {
             ("x-secret", "1"),
             ("keep-alive", "timeout=5"),
             ("proxy-authorization", "Basic abc"),
-            ("x-kept", "yes"),
+            ("accept", "text/plain"),
         ],
         "",
     )
@@ -491,7 +520,7 @@ async fn removes_the_hop_by_hop_headers() {
     assert!(!headers.contains_key("x-secret"));
     assert!(!headers.contains_key("keep-alive"));
     assert!(!headers.contains_key("proxy-authorization"));
-    assert_eq!(headers["x-kept"], "yes");
+    assert_eq!(headers["accept"], "text/plain");
 }
 
 #[tokio::test]

@@ -30,6 +30,29 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
+/// The only request headers that the proxy sends to the upstream, with the
+/// headers that it sets itself (`Host`, `X-Forwarded-*`, `Via`). The proxy
+/// removes every other request header. The names are in lower case.
+///
+/// `Authorization` and `Cookie` are not on the list. The proxy decides from the
+/// client certificate, and the upstream does not need these headers.
+const ALLOWED_REQUEST: [&str; 14] = [
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-encoding",
+    "content-length",
+    "content-type",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-unmodified-since",
+    "range",
+    "user-agent",
+    REQUEST_ID,
+];
+
 /// Headers that tell the upstream about the client and the proxy. The proxy
 /// sets them itself, and it does not trust the values from a client.
 const FORWARDING: [&str; 5] = [
@@ -54,6 +77,18 @@ pub fn remove_hop_by_hop(headers: &mut HeaderMap) {
         headers.remove(name);
     }
     for name in HOP_BY_HOP {
+        headers.remove(name);
+    }
+}
+
+/// Remove each header of a request that is not on the `ALLOWED_REQUEST` list.
+pub fn retain_allowed_request(headers: &mut HeaderMap) {
+    let not_allowed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| !ALLOWED_REQUEST.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    for name in not_allowed {
         headers.remove(name);
     }
 }
@@ -199,6 +234,45 @@ mod tests {
         remove_hop_by_hop(&mut map);
 
         assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn retain_allowed_request_keeps_only_the_headers_on_the_list() {
+        let mut map = headers(&[
+            ("accept", "text/plain"),
+            ("content-type", "text/plain"),
+            ("content-length", "5"),
+            ("user-agent", "test"),
+            ("x-request-id", "id-1"),
+            ("authorization", "Bearer abc"),
+            ("cookie", "a=b"),
+            ("x-custom", "yes"),
+            ("x-forwarded-for", "1.2.3.4"),
+        ]);
+
+        retain_allowed_request(&mut map);
+
+        let mut names: Vec<&str> = map.keys().map(|name| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "accept",
+                "content-length",
+                "content-type",
+                "user-agent",
+                "x-request-id"
+            ]
+        );
+    }
+
+    #[test]
+    fn retain_allowed_request_removes_every_value_of_a_header() {
+        let mut map = headers(&[("cookie", "a=b"), ("cookie", "c=d"), ("accept", "*/*")]);
+
+        retain_allowed_request(&mut map);
+
+        assert_eq!(map.len(), 1, "left: {map:?}");
     }
 
     #[test]

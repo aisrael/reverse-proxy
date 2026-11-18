@@ -262,10 +262,11 @@ where
 ///
 /// - Send the request to the upstream, as HTTP/1.
 /// - Remove the hop-by-hop headers.
+/// - Remove each request header that is not on the list of allowed headers.
 /// - Replace the forwarding headers (`X-Forwarded-*`, `Via`).
 /// - Set `Host` to the address of the upstream.
 ///
-/// Keep the other headers.
+/// Keep the headers on the list of allowed headers.
 /// Return an error if the URI for the upstream is not valid.
 fn prepare_request<B>(
     request: &mut Request<B>,
@@ -292,6 +293,7 @@ fn prepare_request<B>(
     *request.version_mut() = Version::HTTP_11;
     let request_headers = request.headers_mut();
     headers::remove_hop_by_hop(request_headers);
+    headers::retain_allowed_request(request_headers);
     headers::set_forwarding(
         request_headers,
         client_ip,

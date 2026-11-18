@@ -57,6 +57,20 @@ upstream, in these cases:
 The proxy does not decode `%` sequences in the path. See
 `docs/adrs/001-no-percent-decoding-in-path-policy.md`.
 
+## Headers
+
+The proxy sends only some request headers to the upstream: `Accept`,
+`Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Encoding`,
+`Content-Length`, `Content-Type`, `If-Match`, `If-Modified-Since`,
+`If-None-Match`, `If-Unmodified-Since`, `Range`, `User-Agent` and
+`X-Request-Id`. It removes all other request headers, for example
+`Authorization`, `Cookie` and custom headers. It sets `Host`,
+`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `Via` itself,
+and ignores the values that the client sent for them. For a response, it
+removes the hop-by-hop headers (`Connection`, `Transfer-Encoding` and others)
+and forwards the rest. The list is `ALLOWED_REQUEST` in `src/headers.rs`. See
+`docs/adrs/002-headers-the-proxy-forwards.md`.
+
 ## Audit events
 
 The `proxy` mode writes one audit event for each request that it decides on, as
