@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio-util = "0.7.20"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
