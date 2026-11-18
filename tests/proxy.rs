@@ -65,6 +65,10 @@ impl Program {
         let stderr = File::create(&stderr_path).expect("failed to create the STDERR file");
         let child = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
             .arg(mode)
+            // Set both addresses, so the values from the shell (for example,
+            // from `.envrc`) cannot change them.
+            .env("PROXY_ADDR", PROXY_ADDR)
+            .env("SERVER_ADDR", SERVER_ADDR)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()

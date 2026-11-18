@@ -13,6 +13,7 @@ use hyper::Response;
 use hyper::StatusCode;
 use hyper::body::Incoming;
 use std::convert::Infallible;
+use std::sync::LazyLock;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -20,11 +21,22 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-/// Address of the `proxy` mode. It is fixed for now.
-const PROXY_ADDR: &str = "127.0.0.1:8080";
+/// Address of the `proxy` mode when the environment variable `PROXY_ADDR` is not set.
+const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:8080";
 
-/// Address of the `server` mode. The proxy sends its requests here. It is fixed for now.
-const SERVER_ADDR: &str = "127.0.0.1:9000";
+/// Address of the `server` mode when the environment variable `SERVER_ADDR` is not set.
+const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:9000";
+
+/// The address (`host:port`) of the `proxy` mode: `PROXY_ADDR`, or the default.
+static PROXY_ADDR: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("PROXY_ADDR").unwrap_or_else(|_| DEFAULT_PROXY_ADDR.to_string())
+});
+
+/// The address (`host:port`) of the `server` mode: `SERVER_ADDR`, or the default.
+/// The proxy sends its requests here.
+static SERVER_ADDR: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_SERVER_ADDR.to_string())
+});
 
 /// A reverse proxy, and a small web server to test it with.
 #[derive(Parser)]
@@ -57,8 +69,8 @@ async fn main() -> Result<(), Error> {
 
     let mode = cli.command.unwrap_or(Command::Proxy);
     let addr = match mode {
-        Command::Proxy => PROXY_ADDR,
-        Command::Server => SERVER_ADDR,
+        Command::Proxy => PROXY_ADDR.as_str(),
+        Command::Server => SERVER_ADDR.as_str(),
     };
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %listener.local_addr()?, "listening");

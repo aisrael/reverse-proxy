@@ -1,0 +1,12 @@
+# The log level of the program. Use `error`, `warn`, `info`, `debug` or `trace`.
+# You can also use a filter for one crate, for example `reverse_proxy=debug`.
+# The default is `info`. At `debug`, the `h2` crate also logs every HTTP/2 frame.
+# To avoid this, use `reverse_proxy=debug`.
+export RUST_LOG="info"
+
+# The address (`host:port`) of the `proxy` mode. The default is `127.0.0.1:8080`.
+export PROXY_ADDR="127.0.0.1:8080"
+
+# The address (`host:port`) of the `server` mode. The proxy sends its requests to
+# this address. The default is `127.0.0.1:9000`.
+export SERVER_ADDR="127.0.0.1:9000"

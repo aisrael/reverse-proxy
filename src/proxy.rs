@@ -22,6 +22,7 @@ use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -30,10 +31,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
-
-/// Address of the upstream (the `server` mode). The connection uses plain HTTP.
-/// It is fixed for now.
-const UPSTREAM_ADDR: &str = SERVER_ADDR;
 
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,6 +49,9 @@ type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
     // One client for all requests. It keeps connections to the upstream open.
     let client: UpstreamClient = Client::builder(TokioExecutor::new()).build_http();
+    // The upstream is the `server` mode. The connection uses plain HTTP.
+    let upstream: Arc<str> = SERVER_ADDR.as_str().into();
+    info!(%upstream, "sending requests to the upstream");
     let builder = Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
 
@@ -67,7 +67,14 @@ pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
             },
         };
         debug!(%peer, "connection accepted");
-        spawn_connection(&builder, &graceful, stream, peer, client.clone());
+        spawn_connection(
+            &builder,
+            &graceful,
+            stream,
+            peer,
+            client.clone(),
+            upstream.clone(),
+        );
     }
 
     // Stop accepting. Close the listening socket before the wait.
@@ -91,11 +98,12 @@ fn spawn_connection(
     stream: TcpStream,
     peer: SocketAddr,
     client: UpstreamClient,
+    upstream: Arc<str>,
 ) {
     let builder = builder.clone();
     let watcher = graceful.watcher();
     tokio::spawn(async move {
-        let service = service_fn(move |request| handle(client.clone(), request));
+        let service = service_fn(move |request| handle(client.clone(), upstream.clone(), request));
         // The connection borrows `builder`, so create it inside the task.
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
@@ -106,19 +114,20 @@ fn spawn_connection(
     });
 }
 
-/// Send `request` to the upstream and return the response.
+/// Send `request` to `upstream` (a `host:port` address) and return the response.
 ///
 /// Keep the method, the headers, the path and the query. Stream both bodies.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     client: UpstreamClient,
+    upstream: Arc<str>,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     let path_and_query = request
         .uri()
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
-    let uri = match format!("http://{UPSTREAM_ADDR}{path_and_query}").parse::<Uri>() {
+    let uri = match format!("http://{upstream}{path_and_query}").parse::<Uri>() {
         Ok(uri) => uri,
         Err(err) => {
             warn!(%err, "cannot make the upstream URI");
