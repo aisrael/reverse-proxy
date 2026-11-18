@@ -93,6 +93,8 @@ struct Program {
     /// The file that holds the STDERR of the program. The file is read only if
     /// the program fails to start or to stop.
     stderr_path: PathBuf,
+    /// The file that holds the STDOUT of the program: the audit events.
+    stdout_path: PathBuf,
 }
 
 impl Program {
@@ -113,6 +115,11 @@ impl Program {
             std::process::id()
         ));
         let stderr = File::create(&stderr_path).expect("failed to create the STDERR file");
+        let stdout_path = std::env::temp_dir().join(format!(
+            "reverse-proxy-{}-{mode}.stdout",
+            std::process::id()
+        ));
+        let stdout = File::create(&stdout_path).expect("failed to create the STDOUT file");
         let child = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
             .arg(mode)
             // Set both addresses, so the values from the shell (for example,
@@ -123,7 +130,7 @@ impl Program {
             .env("PROXY_TLS_KEY", KEY_PATH)
             .env("PROXY_CLIENT_CA", CA_PATH)
             .env("PROXY_POLICY_FILE", POLICY_PATH)
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("failed to start the program");
@@ -131,6 +138,7 @@ impl Program {
             child,
             addr,
             stderr_path,
+            stdout_path,
         };
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -155,6 +163,20 @@ impl Program {
     fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr_path)
             .unwrap_or_else(|err| format!("(unable to read the STDERR file: {err})"))
+    }
+
+    /// The audit events that the program wrote to STDOUT so far. Panic if a
+    /// line is not a JSON object.
+    fn audit_events(&self) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(&self.stdout_path).expect("failed to read STDOUT");
+        text.lines()
+            .map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|err| panic!("STDOUT line is not JSON ({err}): {line}"));
+                assert!(event.is_object(), "STDOUT line is not an object: {line}");
+                event
+            })
+            .collect()
     }
 
     /// Send SIGINT to the program. This is the same as Ctrl+C.
@@ -198,6 +220,7 @@ impl Drop for Program {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.stderr_path);
+        let _ = std::fs::remove_file(&self.stdout_path);
     }
 }
 
@@ -669,6 +692,130 @@ async fn rejects_a_path_that_is_not_valid() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
         assert!(body.is_empty());
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn writes_an_audit_event_for_a_request_that_the_policy_allows() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let (status, _, _) = send(
+        &reporting_client(),
+        Method::GET,
+        "/reports/1?x=1",
+        &[("x-request-id", "audit-test-1")],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
+    assert_eq!(event["target"], "audit");
+    assert_eq!(event["request_id"], "audit-test-1");
+    assert_eq!(event["identity"], "spiffe://acme/prod/reporting-agent");
+    assert_eq!(event["method"], "GET");
+    // The query is not in the event.
+    assert_eq!(event["path"], "/reports/1");
+    assert_eq!(event["host"], PROXY_ADDR);
+    assert_eq!(event["decision"], "ALLOW");
+    assert_eq!(event["status"], 200);
+    assert_eq!(event["upstream_status"], 200);
+    assert!(event["latency_ms"].is_u64(), "{event}");
+    assert!(event["timestamp"].is_string(), "{event}");
+    assert!(event.get("reason").is_none(), "{event}");
+}
+
+#[tokio::test]
+#[serial]
+async fn writes_an_audit_event_for_each_request_that_the_proxy_denies() {
+    // No upstream runs. The proxy never connects to it for these requests.
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+    let no_identity = TestClient {
+        connector: make_connector(&[b"http/1.1"], Some((NO_URI_CERT_PATH, NO_URI_KEY_PATH))),
+    };
+
+    send(&no_identity, Method::GET, "/", &[], "").await;
+    send(&client(), Method::GET, "/echo/../echo", &[], "").await;
+    send(&reporting_client(), Method::POST, "/reports/1", &[], "").await;
+
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 3, "{events:?}");
+    for event in &events {
+        assert_eq!(event["decision"], "DENY", "{event}");
+        assert!(event.get("upstream_status").is_none(), "{event}");
+        assert!(event["request_id"].is_string(), "{event}");
+    }
+    // No valid identity: the event has no identity.
+    assert_eq!(events[0]["reason"], "no_identity");
+    assert_eq!(events[0]["status"], 401);
+    assert!(events[0].get("identity").is_none(), "{}", events[0]);
+    assert_eq!(events[1]["reason"], "invalid_path");
+    assert_eq!(events[1]["status"], 400);
+    assert_eq!(events[1]["identity"], "spiffe://acme/prod/payment-agent");
+    assert_eq!(events[2]["reason"], "policy");
+    assert_eq!(events[2]["status"], 403);
+    assert_eq!(events[2]["method"], "POST");
+}
+
+#[tokio::test]
+#[serial]
+async fn the_audit_event_of_a_502_has_no_upstream_status() {
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    // The policy allowed the request. The upstream did not answer.
+    assert_eq!(events[0]["decision"], "ALLOW");
+    assert_eq!(events[0]["status"], 502);
+    assert!(events[0].get("upstream_status").is_none(), "{}", events[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn keeps_secrets_out_of_the_output() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    send(
+        &reporting_client(),
+        Method::GET,
+        "/reports/1?token=query-secret",
+        &[
+            ("authorization", "Bearer header-secret"),
+            ("cookie", "session=cookie-secret"),
+        ],
+        "",
+    )
+    .await;
+
+    let output = format!(
+        "{}\n{}",
+        std::fs::read_to_string(&proxy.stdout_path).expect("failed to read STDOUT"),
+        proxy.stderr()
+    );
+    for secret in ["query-secret", "header-secret", "cookie-secret"] {
+        assert!(!output.contains(secret), "{secret} is in the output");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn writes_audit_events_to_stdout_and_other_logs_to_stderr() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    send(&reporting_client(), Method::GET, "/reports/1", &[], "").await;
+
+    assert!(proxy.stderr().contains("listening"), "{}", proxy.stderr());
+    assert!(!proxy.stderr().contains("request_id"), "{}", proxy.stderr());
+    // `audit_events` panics if a line of STDOUT is not a JSON object.
+    assert_eq!(proxy.audit_events().len(), 1);
 }
 
 #[tokio::test]

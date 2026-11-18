@@ -1,7 +1,9 @@
+mod audit;
 mod config;
 mod errors;
 mod headers;
 mod identity;
+mod logging;
 mod policy;
 mod proxy;
 mod server;
@@ -19,7 +21,6 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
-use tracing_subscriber::EnvFilter;
 
 /// A reverse proxy, and a small web server to test it with.
 #[derive(Parser)]
@@ -42,13 +43,7 @@ enum Command {
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
-    // Log level comes from `RUST_LOG` (for example `RUST_LOG=debug`). Default is `info`.
-    // Never log secrets.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    logging::init();
 
     let config = Config::try_from_env()?;
     let shutdown = shutdown_on_ctrl_c();
