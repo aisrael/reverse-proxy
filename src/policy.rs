@@ -1,6 +1,7 @@
 //! The policy: which client identity may send which requests.
 //! It has the same shape as an entry in the policy file (YAML).
 
+use crate::identity::Identity;
 use hyper::Method;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -21,6 +22,10 @@ pub enum PolicyError {
     /// The file does not follow the schema. The text has the first problem.
     #[error("the policy file is not valid: {0}")]
     Schema(String),
+    /// The file follows the schema, but a value is not allowed. The text has the
+    /// first problem.
+    #[error("the policy file is not valid: {0}")]
+    Content(String),
     /// The file is not valid YAML, or it does not have the shape of a policy.
     #[error("cannot parse the policy file: {0}")]
     Parse(#[from] serde_saphyr::Error),
@@ -39,7 +44,55 @@ pub struct Policies {
 pub fn load(path: &str) -> Result<Policies, PolicyError> {
     let text = std::fs::read_to_string(path)?;
     check_schema(&text)?;
-    Ok(serde_saphyr::from_str(&text)?)
+    let policies: Policies = serde_saphyr::from_str(&text)?;
+    check_content(&policies)?;
+    Ok(policies)
+}
+
+/// Check the values that the schema cannot check. Return the first problem.
+///
+/// A rule that is wrong would never match, and the proxy would answer `403`
+/// for every request that the author wanted to allow. We find the mistake at
+/// start instead.
+fn check_content(policies: &Policies) -> Result<(), PolicyError> {
+    for policy in &policies.policies {
+        let identity = &policy.identity;
+        if identity.parse::<Identity>().is_err() {
+            return Err(PolicyError::Content(format!(
+                "`{identity}` is not a valid SPIFFE ID"
+            )));
+        }
+        for rule in &policy.allow {
+            check_rule_path(&rule.path).map_err(|reason| {
+                PolicyError::Content(format!(
+                    "identity `{identity}`, path `{}`: {reason}",
+                    rule.path
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// A rule path is an exact path, or a prefix that ends with `/*`. The part
+/// without the `*` must be a path that `is_valid_path` accepts. If not, no
+/// request could match the rule.
+fn check_rule_path(path: &str) -> Result<(), &'static str> {
+    let literal = match path.strip_suffix('*') {
+        Some(prefix) if prefix.ends_with('/') => prefix,
+        Some(_) => return Err("`*` is only allowed as the last segment, as `/*`"),
+        None => path,
+    };
+    if literal.contains('*') {
+        return Err("`*` is only allowed as the last segment, as `/*`");
+    }
+    if path.contains('?') {
+        return Err("a rule path has no query");
+    }
+    if !is_valid_path(literal) {
+        return Err("the path is not valid (see ADR 001)");
+    }
+    Ok(())
 }
 
 /// Check `text` against the schema. Return the first problem.
@@ -187,6 +240,75 @@ mod tests {
         match check_schema(text) {
             Err(PolicyError::Schema(message)) => message,
             other => panic!("expected a schema error, got {other:?}"),
+        }
+    }
+
+    fn content_message(identity: &str, path: &str) -> String {
+        let policies = Policies {
+            policies: vec![Policy {
+                identity: identity.to_owned(),
+                allow: vec![Rule {
+                    method: Method::GET,
+                    path: path.to_owned(),
+                }],
+            }],
+        };
+        match check_content(&policies) {
+            Err(PolicyError::Content(message)) => message,
+            other => panic!("expected a content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_content_check_accepts_valid_rules() {
+        for path in ["/", "/payments", "/reports/", "/reports/*", "/*", "/a/b/*"] {
+            let policies = Policies {
+                policies: vec![policy(&[("GET", path)])],
+            };
+            assert!(check_content(&policies).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_content_check_rejects_a_wildcard_that_is_not_a_trailing_slash_star() {
+        for path in ["/reports*", "/a/*/b", "/*/b", "*", "/a/**", "/a/*/*"] {
+            assert!(
+                content_message("spiffe://acme/agent", path).contains("`*`"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_content_check_rejects_a_path_that_can_never_match() {
+        for path in [
+            "/a/../b",
+            "/a//b",
+            "/a/./b",
+            "/a%2fb",
+            "/a/%2e%2e/b/*",
+            "/a?x=1",
+        ] {
+            assert!(
+                !content_message("spiffe://acme/agent", path).is_empty(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_content_check_rejects_an_identity_that_is_not_a_spiffe_id() {
+        for identity in [
+            "spiffe://acme",
+            "spiffe://acme/",
+            "spiffe://acme:8080/a",
+            "spiffe://acme/a/../b",
+            "spiffe://acme/a?x=1",
+        ] {
+            assert!(
+                content_message(identity, "/a").contains("SPIFFE"),
+                "{identity}"
+            );
         }
     }
 
