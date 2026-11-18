@@ -10,6 +10,8 @@
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Empty;
+use http_body_util::Full;
+use hyper::Request;
 use hyper::StatusCode;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -132,6 +134,46 @@ async fn get_returns_ok_with_a_fixed_body() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"ok\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn get_echo_returns_ok_and_the_request_headers() {
+    let _server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+    let request = Request::get(format!("http://{ADDR}/echo"))
+        .header("x-test", "one")
+        .header("x-other", "two")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(request).await.expect("the request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-test"], "one");
+    assert_eq!(response.headers()["x-other"], "two");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn post_echo_returns_the_request_body_and_headers() {
+    let _server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let request = Request::post(format!("http://{ADDR}/echo?x=1"))
+        .header("x-test", "one")
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from_static(b"hello")))
+        .unwrap();
+
+    let response = client.request(request).await.expect("the request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-test"], "one");
+    assert_eq!(response.headers()["content-type"], "text/plain");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"hello");
 }
 
 #[tokio::test]

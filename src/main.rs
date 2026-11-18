@@ -1,11 +1,14 @@
+mod proxy;
 mod serve;
 
 use bytes::Bytes;
 use clap::Parser;
 use clap::Subcommand;
+use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::Request;
 use hyper::Response;
+use hyper::StatusCode;
 use hyper::body::Incoming;
 use serve::serve;
 use std::convert::Infallible;
@@ -50,7 +53,7 @@ async fn main() -> io::Result<()> {
         .init();
 
     match cli.command.unwrap_or(Command::Proxy) {
-        Command::Proxy => Err(io::Error::other("proxy mode is not implemented yet")),
+        Command::Proxy => proxy::run().await,
         Command::Server => run_server().await,
     }
 }
@@ -79,7 +82,31 @@ async fn run_server() -> io::Result<()> {
     Ok(())
 }
 
-/// Return `200 OK` with a fixed body for every request.
-async fn handle(_request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// Answer a request.
+///
+/// - `/echo`: send back the request headers and the request body.
+/// - Any other path: `200 OK` with the body `ok`.
+async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.uri().path() == "/echo" {
+        return Ok(echo(request).await);
+    }
     Ok(Response::new(Full::new(Bytes::from_static(b"ok\n"))))
+}
+
+/// Return `200 OK` with the same headers and the same body as the request.
+/// A request without a body (for example `GET`) gets an empty body.
+async fn echo(request: Request<Incoming>) -> Response<Full<Bytes>> {
+    let (parts, body) = request.into_parts();
+    let body = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) => {
+            warn!(%err, "failed to read the request body");
+            let mut response = Response::new(Full::new(Bytes::new()));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            return response;
+        }
+    };
+    let mut response = Response::new(Full::new(body));
+    *response.headers_mut() = parts.headers;
+    response
 }
