@@ -4,6 +4,7 @@
 
 use crate::admission;
 use crate::headers;
+use crate::identity::Identity;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -24,6 +25,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
+use rustls::ServerConnection;
 use std::convert::Infallible;
 use std::error::Error;
 use std::net::IpAddr;
@@ -125,7 +127,10 @@ fn spawn_connection(
             }
         };
         let client_ip = peer.ip();
-        let service = service_fn(move |request| handle(state.clone(), client_ip, request));
+        // Read the identity once. All requests of this connection share it.
+        let identity = client_identity(stream.get_ref().1, peer);
+        let service =
+            service_fn(move |request| handle(state.clone(), client_ip, identity.clone(), request));
         // The connection borrows `builder`, so create it inside the task.
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
@@ -136,8 +141,24 @@ fn spawn_connection(
     });
 }
 
+/// Read the identity of the client from the certificate that it sent in the
+/// handshake. The TLS layer already checked the certificate.
+/// Return `None` if the certificate has no valid identity.
+fn client_identity(connection: &ServerConnection, peer: SocketAddr) -> Option<Identity> {
+    let certificate = connection.peer_certificates()?.first()?;
+    match Identity::from_certificate(certificate) {
+        Ok(identity) => Some(identity),
+        Err(err) => {
+            // Never log the certificate.
+            debug!(%peer, %err, "client certificate has no valid identity");
+            None
+        }
+    }
+}
+
 /// Send `request` to the upstream of `state` and return the response.
-/// `client_ip` is the IP address of the client.
+/// `client_ip` is the IP address of the client. `identity` is the identity of
+/// the client, if its certificate has a valid one.
 ///
 /// Prepare the request, then forward it.
 ///
@@ -149,6 +170,7 @@ fn spawn_connection(
 async fn handle<B>(
     state: Arc<AppState<B>>,
     client_ip: IpAddr,
+    identity: Option<Identity>,
     mut request: Request<B>,
 ) -> Result<Response<Body>, Infallible>
 where
@@ -179,6 +201,7 @@ where
     debug!(
         %method,
         %path,
+        identity = ?identity.as_ref().map(Identity::to_string),
         status = response.status().as_u16(),
         latency_ms = started.elapsed().as_millis() as u64,
         request_id = request_id.to_str().unwrap_or_default(),
@@ -307,7 +330,7 @@ mod tests {
         }
         let request = request.body(Full::new(Bytes::new())).unwrap();
 
-        match handle(state, "192.0.2.7".parse().unwrap(), request).await {
+        match handle(state, "192.0.2.7".parse().unwrap(), None, request).await {
             Ok(response) => response,
             Err(never) => match never {},
         }
