@@ -2,6 +2,7 @@ mod config;
 mod errors;
 mod headers;
 mod identity;
+mod policy;
 mod proxy;
 mod server;
 mod state;
