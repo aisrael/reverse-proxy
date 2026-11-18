@@ -33,6 +33,7 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::info;
@@ -41,15 +42,19 @@ use tracing::warn;
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum time for the TLS handshake of one connection.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The type of every response body. The answer from the upstream and our own
 /// error answer have different body types, so both are boxed.
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// Accept connections on `listener` until `shutdown` is cancelled.
+/// Every connection uses TLS: `acceptor` does the handshake.
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
-pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
+pub async fn serve(listener: TcpListener, shutdown: CancellationToken, acceptor: TlsAcceptor) {
     // The upstream is the `server` mode.
     let state = Arc::new(AppState::new(SERVER_ADDR.as_str()));
     info!(upstream = %state.upstream, "sending requests to the upstream");
@@ -68,7 +73,7 @@ pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
             },
         };
         debug!(%peer, "connection accepted");
-        spawn_connection(&builder, &graceful, stream, peer, state.clone());
+        spawn_connection(&builder, &graceful, &acceptor, stream, peer, state.clone());
     }
 
     // Stop accepting. Close the listening socket before the wait.
@@ -86,16 +91,33 @@ pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
 }
 
 /// Serve one connection in its own task. HTTP/1 and HTTP/2 are both supported.
+///
+/// The task does the TLS handshake first. A handshake that fails or takes more
+/// than `HANDSHAKE_TIMEOUT` closes this connection only. The accept loop does
+/// not wait for it.
 fn spawn_connection(
     builder: &Builder<TokioExecutor>,
     graceful: &GracefulShutdown,
+    acceptor: &TlsAcceptor,
     stream: TcpStream,
     peer: SocketAddr,
     state: Arc<AppState>,
 ) {
     let builder = builder.clone();
+    let acceptor = acceptor.clone();
     let watcher = graceful.watcher();
     tokio::spawn(async move {
+        let stream = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                debug!(%peer, %err, "TLS handshake failed");
+                return;
+            }
+            Err(_) => {
+                debug!(%peer, "TLS handshake timed out");
+                return;
+            }
+        };
         let client_ip = peer.ip();
         let service = service_fn(move |request| handle(state.clone(), client_ip, request));
         // The connection borrows `builder`, so create it inside the task.
@@ -199,7 +221,8 @@ fn prepare_request<B>(
         request_headers,
         client_ip,
         original_host.as_ref(),
-        "http",
+        // Every client connection uses TLS.
+        "https",
         client_version,
     );
     headers::set_host(request_headers, upstream);

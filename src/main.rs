@@ -8,10 +8,12 @@ mod tls;
 use clap::Parser;
 use clap::Subcommand;
 use errors::Error;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
@@ -42,14 +44,12 @@ static TLS_KEY: OnceLock<String> = OnceLock::new();
 
 /// The path of the certificate file from `PROXY_TLS_CERT`.
 /// Return an error if the variable is not set.
-#[expect(dead_code, reason = "the TLS listener will use it")]
 fn tls_cert_path() -> Result<&'static str, Error> {
     env_path(&TLS_CERT, "PROXY_TLS_CERT")
 }
 
 /// The path of the private key file from `PROXY_TLS_KEY`.
 /// Return an error if the variable is not set.
-#[expect(dead_code, reason = "the TLS listener will use it")]
 fn tls_key_path() -> Result<&'static str, Error> {
     env_path(&TLS_KEY, "PROXY_TLS_KEY")
 }
@@ -103,7 +103,11 @@ async fn main() -> Result<(), Error> {
 
     let shutdown = shutdown_on_ctrl_c();
     match mode {
-        Command::Proxy => proxy::serve(listener, shutdown).await,
+        Command::Proxy => {
+            let config = tls::server_config(tls_cert_path()?, tls_key_path()?)?;
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            proxy::serve(listener, shutdown, acceptor).await
+        }
         Command::Server => server::serve(listener, shutdown).await,
     }
 
