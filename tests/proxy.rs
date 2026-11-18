@@ -499,10 +499,9 @@ async fn rejects_a_request_without_an_api_key_before_it_reaches_the_upstream() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
     let client = client();
 
-    let (status, headers, body) = send_raw(&client, Method::GET, "/", &[], "").await;
+    let (status, _, body) = send_raw(&client, Method::GET, "/", &[], "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(headers["content-type"], "application/json");
-    assert_eq!(&body[..], br#"{"message": "Unauthorized"}"#);
+    assert!(body.is_empty());
 
     let (status, _, _) = send_raw(&client, Method::GET, "/", &[("x-api-key", "")], "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

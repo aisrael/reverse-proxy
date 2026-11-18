@@ -7,6 +7,7 @@ use crate::headers;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::BodyExt;
+use http_body_util::Empty;
 use http_body_util::Full;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::Request;
@@ -15,7 +16,6 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
 use hyper::body::Body as RequestBody;
-use hyper::header::CONTENT_TYPE;
 use hyper::header::HOST;
 use hyper::header::HeaderValue;
 use hyper::http::uri::InvalidUri;
@@ -263,16 +263,13 @@ where
 }
 
 /// The answer for a request that admission rejects. The proxy does not
-/// connect to the upstream.
+/// connect to the upstream. The response has the status `401` and an empty body.
 fn unauthorized() -> Response<Body> {
-    let body = Full::new(Bytes::from_static(br#"{"message": "Unauthorized"}"#))
+    let body = Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed_unsync();
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::UNAUTHORIZED;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     response
 }
 
@@ -330,10 +327,9 @@ mod tests {
         let response = call_raw(&[]).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response.headers()["content-type"], "application/json");
         assert_eq!(response.headers()["x-request-id"].len(), 36);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], br#"{"message": "Unauthorized"}"#);
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
