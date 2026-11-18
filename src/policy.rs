@@ -3,6 +3,11 @@
 
 use serde::Deserialize;
 use thiserror::Error;
+use yaml_schema::Engine;
+use yaml_schema::loader;
+
+/// The schema of the policy file.
+const SCHEMA: &str = include_str!("../policy-schema.yaml");
 
 /// The reason why we cannot load the policy file.
 #[derive(Debug, Error)]
@@ -10,6 +15,9 @@ pub enum PolicyError {
     /// The file cannot be read.
     #[error("cannot read the policy file: {0}")]
     Read(#[from] std::io::Error),
+    /// The file does not follow the schema. The text has the first problem.
+    #[error("the policy file is not valid: {0}")]
+    Schema(String),
     /// The file is not valid YAML, or it does not have the shape of a policy.
     #[error("cannot parse the policy file: {0}")]
     Parse(#[from] serde_saphyr::Error),
@@ -22,10 +30,24 @@ pub struct Policies {
     pub policies: Vec<Policy>,
 }
 
-/// Read the policy file (YAML) at `path`.
+/// Read the policy file (YAML) at `path`. The file must follow the schema.
+/// The check stops at the first problem.
 pub fn load(path: &str) -> Result<Policies, PolicyError> {
     let text = std::fs::read_to_string(path)?;
+    check_schema(&text)?;
     Ok(serde_saphyr::from_str(&text)?)
+}
+
+/// Check `text` against the schema. Return the first problem.
+fn check_schema(text: &str) -> Result<(), PolicyError> {
+    let schema = loader::load_from_str(SCHEMA).expect("the policy schema is valid");
+    let context = Engine::evaluate(&schema, text, true)
+        .map_err(|error| PolicyError::Schema(error.to_string()))?;
+    let errors = context.errors.borrow();
+    match errors.first() {
+        Some(error) => Err(PolicyError::Schema(error.to_string())),
+        None => Ok(()),
+    }
 }
 
 /// The rules for one identity.
@@ -147,6 +169,42 @@ mod tests {
             policies.policies[0].identity,
             "spiffe://acme/prod/payment-agent"
         );
+    }
+
+    fn schema_error(text: &str) -> String {
+        match check_schema(text) {
+            Err(PolicyError::Schema(message)) => message,
+            other => panic!("expected a schema error, got {other:?}"),
+        }
+    }
+
+    const VALID: &str = "policies:\n- identity: spiffe://acme/agent\n  allow:\n  - method: GET\n    path: /a\n";
+
+    #[test]
+    fn the_schema_accepts_a_valid_file() {
+        assert!(check_schema(VALID).is_ok());
+    }
+
+    #[test]
+    fn the_schema_accepts_a_method_in_any_case() {
+        assert!(check_schema(&VALID.replace("GET", "get")).is_ok());
+        assert!(check_schema(&VALID.replace("GET", "Patch")).is_ok());
+    }
+
+    #[test]
+    fn the_schema_rejects_a_bad_file() {
+        for text in [
+            VALID.replace("GET", "FETCH"),
+            VALID.replace("spiffe://acme/agent", "https://acme/agent"),
+            VALID.replace("spiffe://acme/agent", "spiffe://bad host"),
+            VALID.replace("/a\n", "a\n"),
+            VALID.replace("    path: /a\n", ""),
+            VALID.replace("  allow:\n  - method: GET\n    path: /a\n", "  allow: []\n"),
+            format!("{VALID}  extra: 1\n"),
+            "other: 1\n".to_owned(),
+        ] {
+            assert!(!schema_error(&text).is_empty(), "accepted: {text}");
+        }
     }
 
     fn policy(rules: &[(&str, &str)]) -> Policy {
