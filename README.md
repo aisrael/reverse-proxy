@@ -32,6 +32,10 @@ The script uses `openssl`. It writes these files to `dev-certs/`:
 - `ca.pem` and `ca.key`: a self-signed CA (EC P-256).
 - `server.pem` and `server.key`: a server certificate (EC P-256), signed by the CA.
   It is valid for `localhost` and `127.0.0.1`.
+- `payment-agent.pem` and `payment-agent.key`: a client certificate (EC P-256),
+  signed by the CA. Its URI SAN is `spiffe://acme/prod/payment-agent`.
+- `reporting-agent.pem` and `reporting-agent.key`: a client certificate (EC P-256),
+  signed by the CA. Its URI SAN is `spiffe://acme/prod/reporting-agent`.
 
 The certificates are valid for 30 days. The script is safe to run many times.
 It makes only the files that are missing or expired.
