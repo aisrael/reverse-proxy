@@ -238,3 +238,49 @@ fn bad_gateway() -> Response<Body> {
     *response.status_mut() = StatusCode::BAD_GATEWAY;
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An upstream address that is not valid, so `prepare_request` fails.
+    /// `handle` then returns at once. It makes no connection and opens no socket.
+    const BAD_UPSTREAM: &str = "not a valid address";
+
+    async fn call(headers: &[(&str, &str)]) -> Response<Body> {
+        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM));
+        let mut request = Request::builder().uri("/path?x=1");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(Full::new(Bytes::new())).unwrap();
+
+        match handle(state, "192.0.2.7".parse().unwrap(), request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_returns_502_when_the_upstream_uri_is_not_valid() {
+        let response = call(&[]).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"Bad Gateway");
+    }
+
+    #[tokio::test]
+    async fn handle_keeps_a_valid_request_id_in_the_response() {
+        let response = call(&[("x-request-id", "client-id-1")]).await;
+
+        assert_eq!(response.headers()["x-request-id"], "client-id-1");
+    }
+
+    #[tokio::test]
+    async fn handle_makes_a_request_id_when_there_is_none() {
+        let response = call(&[]).await;
+
+        assert_eq!(response.headers()["x-request-id"].len(), 36);
+    }
+}
