@@ -2,6 +2,7 @@
 //!
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
+use crate::SERVER_ADDR;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -20,24 +21,19 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
-use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::signal;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-/// Address of the proxy. It is fixed for now.
-const LISTEN_ADDR: &str = "127.0.0.1:8080";
-
 /// Address of the upstream (the `server` mode). The connection uses plain HTTP.
 /// It is fixed for now.
-const UPSTREAM_ADDR: &str = "127.0.0.1:9000";
+const UPSTREAM_ADDR: &str = SERVER_ADDR;
 
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,37 +45,13 @@ type UpstreamClient = Client<HttpConnector, Incoming>;
 /// error answer have different body types, so both are boxed.
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
-/// Run the proxy until Ctrl+C arrives, then shut down gracefully.
-pub async fn run() -> io::Result<()> {
-    let listener = TcpListener::bind(LISTEN_ADDR).await?;
-    info!(addr = %listener.local_addr()?, upstream = UPSTREAM_ADDR, "listening");
-
-    // Cancel the token when Ctrl+C arrives. This starts the graceful shutdown.
-    let token = CancellationToken::new();
-    tokio::spawn({
-        let token = token.clone();
-        async move {
-            match signal::ctrl_c().await {
-                Ok(()) => info!("Ctrl+C received, starting graceful shutdown"),
-                Err(err) => warn!(%err, "failed to listen for Ctrl+C"),
-            }
-            token.cancel();
-        }
-    });
-
-    // One client for all requests. It keeps connections to the upstream open.
-    let client = Client::builder(TokioExecutor::new()).build_http();
-    serve(listener, token, client).await;
-
-    info!("shut down cleanly");
-    Ok(())
-}
-
 /// Accept connections on `listener` until `shutdown` is cancelled.
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
-async fn serve(listener: TcpListener, shutdown: CancellationToken, client: UpstreamClient) {
+pub async fn serve(listener: TcpListener, shutdown: CancellationToken) {
+    // One client for all requests. It keeps connections to the upstream open.
+    let client: UpstreamClient = Client::builder(TokioExecutor::new()).build_http();
     let builder = Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
 

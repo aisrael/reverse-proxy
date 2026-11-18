@@ -10,7 +10,6 @@ use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper::body::Incoming;
-use server::serve;
 use std::convert::Infallible;
 use std::io;
 use tokio::net::TcpListener;
@@ -20,8 +19,11 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-/// Address of the `server` mode. It is fixed for now.
-const LISTEN_ADDR: &str = "127.0.0.1:9000";
+/// Address of the `proxy` mode. It is fixed for now.
+const PROXY_ADDR: &str = "127.0.0.1:8080";
+
+/// Address of the `server` mode. The proxy sends its requests here. It is fixed for now.
+const SERVER_ADDR: &str = "127.0.0.1:9000";
 
 /// A reverse proxy, and a small web server to test it with.
 #[derive(Parser)]
@@ -32,11 +34,11 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Clone, Copy, Subcommand)]
 enum Command {
-    /// Run the reverse proxy (default). Not implemented yet.
+    /// Run the reverse proxy (default). It sends every request to the `server` mode.
     Proxy,
-    /// Run a web server that answers every request with `200 OK`.
+    /// Run a test web server. It is the upstream of the proxy.
     Server,
 }
 
@@ -52,18 +54,27 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
-    match cli.command.unwrap_or(Command::Proxy) {
-        Command::Proxy => proxy::run().await,
-        Command::Server => run_server().await,
-    }
-}
-
-/// Run the web server until Ctrl+C arrives, then shut down gracefully.
-async fn run_server() -> io::Result<()> {
-    let listener = TcpListener::bind(LISTEN_ADDR).await?;
+    let mode = cli.command.unwrap_or(Command::Proxy);
+    let addr = match mode {
+        Command::Proxy => PROXY_ADDR,
+        Command::Server => SERVER_ADDR,
+    };
+    let listener = TcpListener::bind(addr).await?;
     info!(addr = %listener.local_addr()?, "listening");
 
-    // Cancel the token when Ctrl+C arrives. This starts the graceful shutdown.
+    let shutdown = shutdown_on_ctrl_c();
+    match mode {
+        Command::Proxy => proxy::serve(listener, shutdown).await,
+        Command::Server => server::serve(listener, shutdown).await,
+    }
+
+    info!("shut down cleanly");
+    Ok(())
+}
+
+/// Return a token that is cancelled when Ctrl+C arrives.
+/// The cancellation starts the graceful shutdown.
+fn shutdown_on_ctrl_c() -> CancellationToken {
     let token = CancellationToken::new();
     tokio::spawn({
         let token = token.clone();
@@ -75,11 +86,7 @@ async fn run_server() -> io::Result<()> {
             token.cancel();
         }
     });
-
-    serve(listener, token).await;
-
-    info!("shut down cleanly");
-    Ok(())
+    token
 }
 
 /// Answer a request.
