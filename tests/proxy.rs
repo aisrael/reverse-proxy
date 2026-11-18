@@ -313,6 +313,20 @@ async fn removes_the_hop_by_hop_headers() {
 
 #[tokio::test]
 #[serial]
+async fn passes_a_503_with_retry_after_through_unchanged() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    // The upstream answers `503` itself. The proxy must not change it to its own
+    // error status (`502` or `504`).
+    let (status, headers, _) = send(&client(), Method::GET, "/status/503", &[], "").await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+}
+
+#[tokio::test]
+#[serial]
 async fn returns_502_when_the_upstream_is_down() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
 
