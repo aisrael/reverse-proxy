@@ -2,6 +2,23 @@
 
 A reverse proxy, and a small web server to test it with.
 
+## Configuration
+
+The program reads these environment variables once, at start. A variable that is
+set must not be empty.
+
+| Variable         | Default          | Mode     | Meaning                                                    |
+| ---------------- | ---------------- | -------- | ---------------------------------------------------------- |
+| `PROXY_ADDR`     | `127.0.0.1:8080` | `proxy`  | The address (`host:port`) that the proxy listens on.       |
+| `SERVER_ADDR`    | `127.0.0.1:9000` | both     | The address of the `server` mode. The proxy sends its requests here. |
+| `PROXY_TLS_CERT` | none (required)  | `proxy`  | The path of the certificate file (PEM).                    |
+| `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
+| `RUST_LOG`       | `info`           | both     | The log level, for example `debug`.                        |
+
+The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT` or
+`PROXY_TLS_KEY` is not set, or if a file cannot be read. The `server` mode does
+not use the TLS variables.
+
 ## Local TLS setup
 
 Make a CA and a server certificate for local tests:

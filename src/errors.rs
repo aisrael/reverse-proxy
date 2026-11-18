@@ -1,5 +1,6 @@
 //! The error type of the crate.
 
+use crate::config::ConfigError;
 use thiserror::Error;
 
 /// An error that stops the program.
@@ -8,9 +9,9 @@ pub enum Error {
     /// An input or output operation failed, for example `bind`.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// A required environment variable is not set, or its value is not valid text.
-    #[error("environment variable {0} is not set")]
-    MissingEnv(&'static str),
+    /// The configuration is not valid, for example a required variable is not set.
+    #[error("configuration error: {0}")]
+    Config(#[from] ConfigError),
     /// The TLS configuration is not valid, for example the key does not match
     /// the certificate.
     #[error("TLS configuration error: {0}")]

@@ -2,7 +2,6 @@
 //!
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
-use crate::SERVER_ADDR;
 use crate::headers;
 use crate::state::AppState;
 use bytes::Bytes;
@@ -51,12 +50,17 @@ type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// Accept connections on `listener` until `shutdown` is cancelled.
 /// Every connection uses TLS: `acceptor` does the handshake.
+/// The requests go to the upstream at `upstream` (a `host:port` address).
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
-pub async fn serve(listener: TcpListener, shutdown: CancellationToken, acceptor: TlsAcceptor) {
-    // The upstream is the `server` mode.
-    let state = Arc::new(AppState::new(SERVER_ADDR.as_str()));
+pub async fn serve(
+    listener: TcpListener,
+    shutdown: CancellationToken,
+    acceptor: TlsAcceptor,
+    upstream: &str,
+) {
+    let state = Arc::new(AppState::new(upstream));
     info!(upstream = %state.upstream, "sending requests to the upstream");
     let builder = Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();

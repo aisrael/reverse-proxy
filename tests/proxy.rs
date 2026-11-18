@@ -531,3 +531,24 @@ async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
     let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+#[serial]
+async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
+    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY"] {
+        // The program must stop before it binds, so it needs no free port.
+        let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
+            .arg("proxy")
+            .env("PROXY_ADDR", PROXY_ADDR)
+            .env("SERVER_ADDR", SERVER_ADDR)
+            .env("PROXY_TLS_CERT", CERT_PATH)
+            .env("PROXY_TLS_KEY", KEY_PATH)
+            .env_remove(missing)
+            .output()
+            .expect("failed to run the program");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{missing}: {stderr}");
+        assert!(stderr.contains(missing), "{missing}: {stderr}");
+    }
+}

@@ -1,3 +1,4 @@
+mod config;
 mod errors;
 mod headers;
 mod proxy;
@@ -7,10 +8,9 @@ mod tls;
 
 use clap::Parser;
 use clap::Subcommand;
+use config::Config;
 use errors::Error;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::OnceLock;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_rustls::TlsAcceptor;
@@ -18,51 +18,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
-
-/// Address of the `proxy` mode when the environment variable `PROXY_ADDR` is not set.
-const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:8080";
-
-/// Address of the `server` mode when the environment variable `SERVER_ADDR` is not set.
-const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:9000";
-
-/// The address (`host:port`) of the `proxy` mode: `PROXY_ADDR`, or the default.
-static PROXY_ADDR: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("PROXY_ADDR").unwrap_or_else(|_| DEFAULT_PROXY_ADDR.to_string())
-});
-
-/// The address (`host:port`) of the `server` mode: `SERVER_ADDR`, or the default.
-/// The proxy sends its requests here.
-static SERVER_ADDR: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_SERVER_ADDR.to_string())
-});
-
-/// The path of the certificate file. It is set on the first call of `tls_cert_path`.
-static TLS_CERT: OnceLock<String> = OnceLock::new();
-
-/// The path of the private key file. It is set on the first call of `tls_key_path`.
-static TLS_KEY: OnceLock<String> = OnceLock::new();
-
-/// The path of the certificate file from `PROXY_TLS_CERT`.
-/// Return an error if the variable is not set.
-fn tls_cert_path() -> Result<&'static str, Error> {
-    env_path(&TLS_CERT, "PROXY_TLS_CERT")
-}
-
-/// The path of the private key file from `PROXY_TLS_KEY`.
-/// Return an error if the variable is not set.
-fn tls_key_path() -> Result<&'static str, Error> {
-    env_path(&TLS_KEY, "PROXY_TLS_KEY")
-}
-
-/// Read the variable `name` once and keep its value in `cell`.
-/// The next calls return the kept value.
-fn env_path(cell: &'static OnceLock<String>, name: &'static str) -> Result<&'static str, Error> {
-    if let Some(path) = cell.get() {
-        return Ok(path);
-    }
-    let path = std::env::var(name).map_err(|_| Error::MissingEnv(name))?;
-    Ok(cell.get_or_init(|| path))
-}
 
 /// A reverse proxy, and a small web server to test it with.
 #[derive(Parser)]
@@ -93,26 +48,32 @@ async fn main() -> Result<(), Error> {
         )
         .init();
 
-    let mode = cli.command.unwrap_or(Command::Proxy);
-    let addr = match mode {
-        Command::Proxy => PROXY_ADDR.as_str(),
-        Command::Server => SERVER_ADDR.as_str(),
-    };
-    let listener = TcpListener::bind(addr).await?;
-    info!(addr = %listener.local_addr()?, "listening");
-
+    let config = Config::try_from_env()?;
     let shutdown = shutdown_on_ctrl_c();
-    match mode {
+    match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {
-            let config = tls::server_config(tls_cert_path()?, tls_key_path()?)?;
-            let acceptor = TlsAcceptor::from(Arc::new(config));
-            proxy::serve(listener, shutdown, acceptor).await
+            // Check the TLS setup before the bind. A wrong setup stops the proxy at once.
+            let (cert_path, key_path) = config.tls_paths()?;
+            let tls_config = tls::server_config(cert_path, key_path)?;
+            let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+            let listener = bind(config.proxy_addr()).await?;
+            proxy::serve(listener, shutdown, acceptor, config.server_addr()).await
         }
-        Command::Server => server::serve(listener, shutdown).await,
+        Command::Server => {
+            let listener = bind(config.server_addr()).await?;
+            server::serve(listener, shutdown).await
+        }
     }
 
     info!("shut down cleanly");
     Ok(())
+}
+
+/// Listen on `addr` (`host:port`).
+async fn bind(addr: &str) -> Result<TcpListener, Error> {
+    let listener = TcpListener::bind(addr).await?;
+    info!(addr = %listener.local_addr()?, "listening");
+    Ok(listener)
 }
 
 /// Return a token that is cancelled when Ctrl+C arrives.
