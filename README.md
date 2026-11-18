@@ -96,10 +96,11 @@ cargo run -- proxy
 In a third terminal, run:
 
 ```sh
-scripts/send-test-requests.py
+scripts/send-test-requests.rb
 ```
 
-The script checks that the `server` and the `proxy` are running. Then it sends
+The script is in Ruby (3.x). It uses only the standard library. It checks that
+the `server` and the `proxy` are running. Then it sends
 requests with each test certificate and prints the status of each answer. It
 exits with code 1 if a status is not the expected one. It expects the rules of
 `policies.yaml` in this repository. The requests cover:
