@@ -82,6 +82,47 @@ change the audit events.
 
 An event never has a header, a cookie, a body or a query.
 
+## Test it end to end
+
+Make the test certificates (see "Local TLS setup"), then start the `server` and
+the `proxy` in two terminals. The proxy needs the TLS variables and
+`PROXY_POLICY_FILE=policies.yaml`:
+
+```sh
+cargo run -- server
+cargo run -- proxy
+```
+
+In a third terminal, run:
+
+```sh
+scripts/send-test-requests.py
+```
+
+The script checks that the `server` and the `proxy` are running. Then it sends
+requests with each test certificate and prints the status of each answer. It
+exits with code 1 if a status is not the expected one. It expects the rules of
+`policies.yaml` in this repository. The requests cover:
+
+- requests that the policy allows (`200`);
+- requests that it denies (`403`);
+- paths that are not valid (`400`);
+- a certificate with no identity (`401`);
+- clients that fail the TLS handshake: no certificate, an untrusted CA, an
+  expired certificate.
+
+The audit events are in the terminal of the `proxy` (STDOUT), one line for each
+request that passed the handshake. A request with a query, such as
+`/reports/1?token=...`, must have only `/reports/1` in the `path` field.
+
+To send one request by hand:
+
+```sh
+curl --cacert dev-certs/ca.pem \
+  --cert dev-certs/payment-agent.pem --key dev-certs/payment-agent.key \
+  -X POST https://127.0.0.1:8080/payments
+```
+
 ## Local TLS setup
 
 Make a CA and a server certificate for local tests:
