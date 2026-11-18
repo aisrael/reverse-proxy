@@ -1,5 +1,5 @@
 mod proxy;
-mod serve;
+mod server;
 
 use bytes::Bytes;
 use clap::Parser;
@@ -10,7 +10,7 @@ use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper::body::Incoming;
-use serve::serve;
+use server::serve;
 use std::convert::Infallible;
 use std::io;
 use tokio::net::TcpListener;
