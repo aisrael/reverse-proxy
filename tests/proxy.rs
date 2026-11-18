@@ -51,7 +51,7 @@ const SERVER_ADDR: &str = "127.0.0.1:9000";
 
 /// The certificate of the dev CA. The proxy uses a certificate that this CA signed.
 const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/ca.pem");
-const POLICY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/policies.yaml");
+const POLICY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/policies.yaml");
 
 /// The certificate and the key of the proxy.
 const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.pem");
@@ -73,6 +73,13 @@ const UNTRUSTED_KEY_PATH: &str =
 /// in January 2020.
 const EXPIRED_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.pem");
 const EXPIRED_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.key");
+
+/// The client certificate of `reporting-agent`. The test policy lets it read
+/// reports only.
+const REPORTING_CERT_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/reporting-agent.pem");
+const REPORTING_KEY_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/reporting-agent.key");
 
 /// A client certificate and key that the dev CA signed. The certificate has no
 /// URI SAN, so the client has no identity.
@@ -202,6 +209,16 @@ struct TestClient {
 fn client() -> TestClient {
     TestClient {
         connector: tls_connector(&[b"http/1.1"]),
+    }
+}
+
+/// A client with the certificate of `reporting-agent`.
+fn reporting_client() -> TestClient {
+    TestClient {
+        connector: make_connector(
+            &[b"http/1.1"],
+            Some((REPORTING_CERT_PATH, REPORTING_KEY_PATH)),
+        ),
     }
 }
 
@@ -596,6 +613,62 @@ async fn rejects_a_request_from_a_certificate_without_an_identity() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(headers.contains_key("x-request-id"));
     assert!(body.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn forwards_a_request_that_the_policy_allows() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = reporting_client();
+
+    let (status, _, body) = send(&client, Method::GET, "/reports/1?x=1", &[], "").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"ok\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_request_that_the_policy_does_not_allow() {
+    // No upstream runs. A 502 would mean that the proxy tried to connect.
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let reporting = reporting_client();
+
+    for (client, method, path) in [
+        // The path is not in the policy of this identity.
+        (&reporting, Method::GET, "/echo"),
+        // The method is not allowed.
+        (&reporting, Method::POST, "/reports/1"),
+        // The prefix needs one more segment.
+        (&reporting, Method::GET, "/reports"),
+        (&client(), Method::GET, "/payments"),
+    ] {
+        let (status, headers, body) = send(client, method.clone(), path, &[], "").await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert!(headers.contains_key("x-request-id"));
+        assert!(body.is_empty());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_path_that_is_not_valid() {
+    // No upstream runs. A 502 would mean that the proxy tried to connect.
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    for path in [
+        "/echo/../echo",
+        "/echo/%2e%2e/echo",
+        "/echo//x",
+        "/status/%2Fx",
+    ] {
+        let (status, _, body) = send(&client(), Method::GET, path, &[], "").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert!(body.is_empty());
+    }
 }
 
 #[tokio::test]

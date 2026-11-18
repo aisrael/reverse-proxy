@@ -1,0 +1,21 @@
+# The policy for the tests of the proxy. It lets `payment-agent` use the paths
+# of the test `server`. `reporting-agent` may read reports only.
+policies:
+- identity: "spiffe://acme/prod/payment-agent"
+  allow:
+  - method: GET
+    path: "/"
+  - method: GET
+    path: "/echo"
+  - method: POST
+    path: "/echo"
+  - method: GET
+    path: "/any/*"
+  - method: GET
+    path: "/status/*"
+  - method: POST
+    path: "/payments"
+- identity: "spiffe://acme/prod/reporting-agent"
+  allow:
+  - method: GET
+    path: "/reports/*"

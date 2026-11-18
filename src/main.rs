@@ -62,7 +62,7 @@ async fn main() -> Result<(), Error> {
             info!(identities = policies.policies.len(), "policy loaded");
             let acceptor = TlsAcceptor::from(Arc::new(tls_config));
             let listener = bind(config.proxy_addr()).await?;
-            proxy::serve(listener, shutdown, acceptor, config.server_addr()).await
+            proxy::serve(listener, shutdown, acceptor, config.server_addr(), policies).await
         }
         Command::Server => {
             let listener = bind(config.server_addr()).await?;

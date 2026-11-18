@@ -15,10 +15,9 @@ pub enum PolicyError {
     Parse(#[from] serde_saphyr::Error),
 }
 
-/// The policy file. We use this type only to load the file.
+/// The policy file: the policy of every identity.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct Policies {
     pub policies: Vec<Policy>,
 }
@@ -32,7 +31,6 @@ pub fn load(path: &str) -> Result<Policies, PolicyError> {
 /// The rules for one identity.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct Policy {
     /// A SPIFFE ID, for example `spiffe://acme/prod/payment-agent`.
     pub identity: String,
@@ -43,12 +41,23 @@ pub struct Policy {
 /// One allowed request: a method and a path.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct Rule {
     /// The HTTP method, for example `GET`.
     pub method: String,
     /// An exact path, or a prefix that ends with `/*`.
     pub path: String,
+}
+
+impl Policies {
+    /// Return `true` if `identity` (a SPIFFE ID) may send the request.
+    /// An identity with no entry may send nothing. If an identity has more than
+    /// one entry, it may send what any of them allows.
+    pub fn authorize(&self, identity: &str, method: &str, path: &str) -> bool {
+        self.policies
+            .iter()
+            .filter(|policy| policy.identity == identity)
+            .any(|policy| policy.authorize(method, path))
+    }
 }
 
 impl Policy {
@@ -64,7 +73,6 @@ impl Policy {
     ///
     /// The query is not part of the path. A path that `is_valid_path` rejects
     /// never matches.
-    #[allow(dead_code)]
     pub fn authorize(&self, method: &str, path: &str) -> bool {
         let path = without_query(path);
         is_valid_path(path)
@@ -99,7 +107,6 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 ///
 /// We never decode `%` sequences, so a client cannot hide a dot segment or a
 /// slash in one.
-#[allow(dead_code)]
 pub fn is_valid_path(path: &str) -> bool {
     let path = without_query(path);
     let Some(rest) = path.strip_prefix('/') else {
@@ -281,5 +288,38 @@ mod tests {
         ] {
             assert!(!is_valid_path(path), "{path:?}");
         }
+    }
+
+    #[test]
+    fn policies_allow_only_what_the_identity_may_send() {
+        let policies = Policies {
+            policies: vec![
+                policy(&[("GET", "/a")]),
+                Policy {
+                    identity: "spiffe://acme/prod/other".to_owned(),
+                    allow: vec![Rule {
+                        method: "GET".to_owned(),
+                        path: "/b".to_owned(),
+                    }],
+                },
+            ],
+        };
+        let agent = "spiffe://acme/prod/agent";
+
+        assert!(policies.authorize(agent, "GET", "/a"));
+        assert!(!policies.authorize(agent, "GET", "/b"));
+        assert!(policies.authorize("spiffe://acme/prod/other", "GET", "/b"));
+        assert!(!policies.authorize("spiffe://acme/prod/unknown", "GET", "/a"));
+    }
+
+    #[test]
+    fn policies_merge_the_entries_of_one_identity() {
+        let policies = Policies {
+            policies: vec![policy(&[("GET", "/a")]), policy(&[("POST", "/b")])],
+        };
+        let agent = "spiffe://acme/prod/agent";
+
+        assert!(policies.authorize(agent, "GET", "/a"));
+        assert!(policies.authorize(agent, "POST", "/b"));
     }
 }

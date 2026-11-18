@@ -1,5 +1,6 @@
 //! The state that the proxy shares between all requests.
 
+use crate::policy::Policies;
 use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
@@ -19,6 +20,8 @@ pub struct AppState<B = Incoming> {
     pub client: UpstreamClient<B>,
     /// The address (`host:port`) of the upstream. The connection uses plain HTTP.
     pub upstream: String,
+    /// Which identity may send which requests.
+    pub policies: Policies,
 }
 
 impl<B> AppState<B>
@@ -27,10 +30,11 @@ where
     B::Data: Send,
 {
     /// Make the state for an upstream at `upstream` (a `host:port` address).
-    pub fn new(upstream: &str) -> Self {
+    pub fn new(upstream: &str, policies: Policies) -> Self {
         Self {
             client: Client::builder(TokioExecutor::new()).build_http(),
             upstream: upstream.to_string(),
+            policies,
         }
     }
 }

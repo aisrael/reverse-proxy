@@ -25,6 +25,26 @@ The `server` mode does not use the TLS variables.
 The `proxy` mode requires a client certificate (mTLS). A client without a
 certificate that the CA in `PROXY_CLIENT_CA` signed fails the TLS handshake.
 
+## Policy
+
+The `proxy` mode checks every request against the policy file
+(`PROXY_POLICY_FILE`, see `policies.yaml`). The file lists, for each client
+identity (SPIFFE ID), the methods and paths that it may use. A path is exact
+(`/payments`) or a prefix (`/reports/*`). A prefix matches whole segments, and
+needs at least one more segment. The proxy ignores the query.
+
+The proxy answers with an empty body, and does not send the request to the
+upstream, in these cases:
+
+| Status | Case                                                            |
+| ------ | --------------------------------------------------------------- |
+| `401`  | The client certificate has no valid identity.                   |
+| `400`  | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, NUL. |
+| `403`  | The policy does not allow this identity to send this request.   |
+
+The proxy does not decode `%` sequences in the path. See
+`docs/adrs/001-no-percent-decoding-in-path-policy.md`.
+
 ## Local TLS setup
 
 Make a CA and a server certificate for local tests:
