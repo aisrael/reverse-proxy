@@ -33,13 +33,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// The mode to run.
+    /// The mode to run. The default is `proxy`.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the reverse proxy (default). Not implemented yet.
+    Proxy,
     /// Run a web server that answers every request with `200 OK`.
     Server,
 }
@@ -56,7 +58,8 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
-    match cli.command {
+    match cli.command.unwrap_or(Command::Proxy) {
+        Command::Proxy => Err(io::Error::other("proxy mode is not implemented yet")),
         Command::Server => run_server().await,
     }
 }
