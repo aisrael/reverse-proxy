@@ -29,6 +29,10 @@
 #   expired-agent.pem, expired-agent.key
 #                           A client certificate that the CA signed. It expired
 #                           in January 2020. The `check` command does not report it.
+#   no-uri-agent.pem, no-uri-agent.key
+#                           A client certificate that the CA signed. It has no
+#                           URI SAN, so it has no SPIFFE ID. The TLS handshake
+#                           works, but the proxy must answer 401.
 
 set -euo pipefail
 
@@ -114,9 +118,11 @@ EXT
 # Arguments: the name, the certificate file and the key file of the CA that
 # signs it. Two more arguments (a start date and an end date, both as
 # YYYYMMDDHHMMSSZ) set the validity. Without them, the certificate is valid for
-# $DAYS days from now.
+# $DAYS days from now. A last argument sets the subject alternative name. The
+# default is the SPIFFE ID.
 make_client() {
     local name="$1" ca_cert="$2" ca_key="$3" start="${4:-}" end="${5:-}" tmp
+    local san="${6:-URI:$SPIFFE_PREFIX/$name}"
     tmp="$(mktemp -d)"
     # Remove the temporary files when the function ends or fails.
     trap 'rm -rf "${tmp:-}"' RETURN
@@ -127,7 +133,7 @@ make_client() {
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature
 extendedKeyUsage = clientAuth
-subjectAltName = URI:$SPIFFE_PREFIX/$name
+subjectAltName = $san
 EXT
     if [ -n "$start" ]; then
         # `x509 -req` cannot set a start date, so use `ca` with a small config.
@@ -162,6 +168,11 @@ make_expired_client() {
     make_client expired-agent "$CA_CERT" "$CA_KEY" 20200101000000Z 20200102000000Z
 }
 
+# A certificate with a DNS SAN and no URI SAN.
+make_no_uri_client() {
+    make_client no-uri-agent "$CA_CERT" "$CA_KEY" "" "" "DNS:no-uri-agent"
+}
+
 make_untrusted_client() {
     make_client untrusted-agent "$OTHER_CA_CERT" "$OTHER_CA_KEY"
 }
@@ -172,9 +183,11 @@ check)
     files=("$CA_CERT" "$CA_KEY" "$SERVER_CERT" "$SERVER_KEY"
         "$OTHER_CA_CERT" "$OTHER_CA_KEY"
         "$DIR/untrusted-agent.pem" "$DIR/untrusted-agent.key"
-        "$DIR/expired-agent.pem" "$DIR/expired-agent.key")
+        "$DIR/expired-agent.pem" "$DIR/expired-agent.key"
+        "$DIR/no-uri-agent.pem" "$DIR/no-uri-agent.key")
     # `expired-agent.pem` is expired on purpose, so it is not in this list.
-    certs=("$CA_CERT" "$SERVER_CERT" "$OTHER_CA_CERT" "$DIR/untrusted-agent.pem")
+    certs=("$CA_CERT" "$SERVER_CERT" "$OTHER_CA_CERT" "$DIR/untrusted-agent.pem"
+        "$DIR/no-uri-agent.pem")
     for name in "${CLIENT_NAMES[@]}"; do
         files+=("$DIR/$name.pem" "$DIR/$name.key")
         certs+=("$DIR/$name.pem")
@@ -204,6 +217,7 @@ check)
             make_client "$name" "$CA_CERT" "$CA_KEY"
         done
         make_expired_client
+        make_no_uri_client
         made=true
     else
         if ! server_ok; then
@@ -219,6 +233,10 @@ check)
         # This certificate is expired on purpose. Make it only if it is missing.
         if [ ! -f "$DIR/expired-agent.key" ] || [ ! -f "$DIR/expired-agent.pem" ]; then
             make_expired_client
+            made=true
+        fi
+        if ! client_ok no-uri-agent; then
+            make_no_uri_client
             made=true
         fi
     fi

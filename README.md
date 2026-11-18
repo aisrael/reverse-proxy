@@ -49,6 +49,9 @@ these clients:
   second CA signed.
 - `expired-agent.pem` and `expired-agent.key`: a client certificate that the CA
   signed. It expired in January 2020. The `check` command does not report it.
+- `no-uri-agent.pem` and `no-uri-agent.key`: a client certificate that the CA
+  signed. It has no URI SAN, so it has no SPIFFE ID. The handshake works, but
+  the proxy answers every request with `401`.
 
 The certificates are valid for 30 days. The script is safe to run many times.
 It makes only the files that are missing or expired.
