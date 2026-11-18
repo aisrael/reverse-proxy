@@ -14,7 +14,7 @@ use hyper::Response;
 use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
-use hyper::body::Incoming;
+use hyper::body::Body as RequestBody;
 use hyper::header::HOST;
 use hyper::header::HeaderValue;
 use hyper::http::uri::InvalidUri;
@@ -24,6 +24,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
+use std::error::Error;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -117,11 +118,16 @@ fn spawn_connection(
 /// is valid. Otherwise make a new one.
 ///
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
-async fn handle(
-    state: Arc<AppState>,
+async fn handle<B>(
+    state: Arc<AppState<B>>,
     client_ip: IpAddr,
-    mut request: Request<Incoming>,
-) -> Result<Response<Body>, Infallible> {
+    mut request: Request<B>,
+) -> Result<Response<Body>, Infallible>
+where
+    B: RequestBody + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
+{
     let started = Instant::now();
     // Keep the method and the path for the log line. Never log the query.
     let method = request.method().clone();
@@ -203,7 +209,12 @@ fn prepare_request<B>(
 /// Send the prepared `request` to the upstream and return the response, with
 /// the hop-by-hop headers removed. Stream the body of the response.
 /// If the upstream fails, return `502 Bad Gateway`.
-async fn forward(state: &AppState, request: Request<Incoming>) -> Response<Body> {
+async fn forward<B>(state: &AppState<B>, request: Request<B>) -> Response<Body>
+where
+    B: RequestBody + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
+{
     match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
