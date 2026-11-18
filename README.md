@@ -16,9 +16,12 @@ set must not be empty.
 | `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. |
 | `RUST_LOG`       | `info`           | both     | The log level, for example `debug`.                        |
 
-The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT` or
-`PROXY_TLS_KEY` is not set, or if a file cannot be read. The `server` mode does
-not use the TLS variables.
+The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT`,
+`PROXY_TLS_KEY` or `PROXY_CLIENT_CA` is not set, or if a file cannot be read.
+The `server` mode does not use the TLS variables.
+
+The `proxy` mode requires a client certificate (mTLS). A client without a
+certificate that the CA in `PROXY_CLIENT_CA` signed fails the TLS handshake.
 
 ## Local TLS setup
 

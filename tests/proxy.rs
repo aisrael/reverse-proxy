@@ -23,6 +23,7 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::ServerName;
 use rustls_pki_types::pem::PemObject;
 use serial_test::serial;
@@ -54,6 +55,11 @@ const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/ca.pem");
 /// The certificate and the key of the proxy.
 const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.pem");
 const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.key");
+
+/// The certificate and the key of the test client. The CA signed it. Its
+/// SPIFFE ID is `spiffe://acme/prod/payment-agent`.
+const CLIENT_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.pem");
+const CLIENT_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.key");
 
 /// A running copy of the program. The process stops when this value is dropped.
 struct Program {
@@ -90,6 +96,7 @@ impl Program {
             .env("SERVER_ADDR", SERVER_ADDR)
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
+            .env("PROXY_CLIENT_CA", CA_PATH)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -168,7 +175,7 @@ impl Drop for Program {
     }
 }
 
-/// A client that trusts the dev CA. It opens a new connection for each request.
+/// A client that trusts the dev CA and sends a client certificate. It opens a new connection for each request.
 struct TestClient {
     connector: TlsConnector,
 }
@@ -179,7 +186,8 @@ fn client() -> TestClient {
     }
 }
 
-/// Make a TLS connector that trusts the dev CA and offers `alpn` protocols.
+/// Make a TLS connector that trusts the dev CA, sends the client certificate
+/// and offers `alpn` protocols.
 fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let certs = CertificateDer::pem_file_iter(CA_PATH)
@@ -189,12 +197,19 @@ fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
             .add(cert.expect("the CA file is not valid"))
             .expect("the CA certificate is not valid");
     }
+    let client_certs = CertificateDer::pem_file_iter(CLIENT_CERT_PATH)
+        .expect("cannot read the client certificate. Run ./scripts/gen-dev-certs.sh first")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the client certificate file is not valid");
+    let client_key =
+        PrivateKeyDer::from_pem_file(CLIENT_KEY_PATH).expect("cannot read the client key");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("invalid protocol versions")
         .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_client_auth_cert(client_certs, client_key)
+        .expect("the client certificate does not match the key");
     config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
     TlsConnector::from(Arc::new(config))
 }
@@ -564,7 +579,7 @@ async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
 #[tokio::test]
 #[serial]
 async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
-    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY"] {
+    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY", "PROXY_CLIENT_CA"] {
         // The program must stop before it binds, so it needs no free port.
         let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
             .arg("proxy")
@@ -572,6 +587,7 @@ async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
             .env("SERVER_ADDR", SERVER_ADDR)
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
+            .env("PROXY_CLIENT_CA", CA_PATH)
             .env_remove(missing)
             .output()
             .expect("failed to run the program");
