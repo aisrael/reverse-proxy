@@ -5,6 +5,8 @@ use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper::body::Incoming;
+use hyper::header::HeaderValue;
+use hyper::header::RETRY_AFTER;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
@@ -84,12 +86,39 @@ fn spawn_connection(
 /// Answer a request.
 ///
 /// - `/echo`: send back the request headers and the request body.
+/// - `/status/{code}`: answer with that status code and an empty body. A `503`
+///   also has the header `Retry-After: 1`.
 /// - Any other path: `200 OK` with the body `ok`.
 async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    if request.uri().path() == "/echo" {
+    let path = request.uri().path();
+    if path == "/echo" {
         return Ok(echo(request).await);
     }
+    if let Some(code) = path.strip_prefix("/status/") {
+        return Ok(status(code));
+    }
     Ok(Response::new(Full::new(Bytes::from_static(b"ok\n"))))
+}
+
+/// Return an empty answer with the status `code`. Return `400` if `code` is not
+/// a valid status code.
+fn status(code: &str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::new()));
+    let Some(status) = code
+        .parse::<u16>()
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+    else {
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
+    };
+    *response.status_mut() = status;
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 /// Return `200 OK` with the same headers and the same body as the request.

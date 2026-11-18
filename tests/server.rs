@@ -181,6 +181,52 @@ async fn post_echo_returns_the_request_body_and_headers() {
 
 #[tokio::test]
 #[serial]
+async fn status_returns_the_requested_status_code() {
+    let _server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+
+    let response = client
+        .get(format!("http://{ADDR}/status/418").parse().unwrap())
+        .await
+        .expect("the request failed");
+
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert!(!response.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+#[serial]
+async fn status_503_has_a_retry_after_header() {
+    let _server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+
+    let response = client
+        .get(format!("http://{ADDR}/status/503").parse().unwrap())
+        .await
+        .expect("the request failed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+}
+
+#[tokio::test]
+#[serial]
+async fn status_returns_400_for_an_invalid_code() {
+    let _server = Server::start().await;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+
+    for code in ["abc", "99", "1000", ""] {
+        let response = client
+            .get(format!("http://{ADDR}/status/{code}").parse().unwrap())
+            .await
+            .expect("the request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "code: {code:?}");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn ctrl_c_stops_the_server_with_exit_code_0() {
     let mut server = Server::start().await;
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
