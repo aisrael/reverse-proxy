@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "features/**"
+      - "crates/**"
+      - ".cargo/**"
+      - "Cargo.*"
+      - ".rustfmt.toml"
+      - "README.md"
+      - ".github/workflows/ci.yml"
+      - "scripts/build-softhsm.sh"
+      - "scripts/smoke-softhsm.sh"
+      - "scripts/softhsm.env"
+      - "Dockerfile"
+
+permissions:
+  contents: read
+
+env:
+  # We use environment variables to specify the Rust version and other settings once
+  RUST_TOOLCHAIN: 1.99.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
