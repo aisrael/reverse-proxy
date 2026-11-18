@@ -16,6 +16,10 @@ pub enum Error {
     /// the certificate.
     #[error("TLS configuration error: {0}")]
     Tls(#[from] rustls::Error),
+    /// The verifier for client certificates cannot be made, for example the CA
+    /// bundle is empty.
+    #[error("client certificate verifier error: {0}")]
+    ClientVerifier(#[from] rustls::server::VerifierBuilderError),
     /// A PEM file cannot be read, or it has no item of the type that we need.
     #[error("cannot read {path}: {source}")]
     Pem {

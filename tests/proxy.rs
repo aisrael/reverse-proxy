@@ -23,6 +23,7 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::ServerName;
 use rustls_pki_types::pem::PemObject;
 use serial_test::serial;
@@ -54,6 +55,23 @@ const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/ca.pem");
 /// The certificate and the key of the proxy.
 const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.pem");
 const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/server.key");
+
+/// The certificate and the key of the test client. The CA signed it. Its
+/// SPIFFE ID is `spiffe://acme/prod/payment-agent`.
+const CLIENT_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.pem");
+const CLIENT_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/payment-agent.key");
+
+/// A client certificate and key that a second CA signed. The proxy does not
+/// trust that CA.
+const UNTRUSTED_CERT_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/untrusted-agent.pem");
+const UNTRUSTED_KEY_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/untrusted-agent.key");
+
+/// A client certificate and key that the dev CA signed. The certificate expired
+/// in January 2020.
+const EXPIRED_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.pem");
+const EXPIRED_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dev-certs/expired-agent.key");
 
 /// A running copy of the program. The process stops when this value is dropped.
 struct Program {
@@ -90,6 +108,7 @@ impl Program {
             .env("SERVER_ADDR", SERVER_ADDR)
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
+            .env("PROXY_CLIENT_CA", CA_PATH)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -168,7 +187,7 @@ impl Drop for Program {
     }
 }
 
-/// A client that trusts the dev CA. It opens a new connection for each request.
+/// A client that trusts the dev CA and sends a client certificate. It opens a new connection for each request.
 struct TestClient {
     connector: TlsConnector,
 }
@@ -179,8 +198,16 @@ fn client() -> TestClient {
     }
 }
 
-/// Make a TLS connector that trusts the dev CA and offers `alpn` protocols.
+/// Make a TLS connector that trusts the dev CA, sends the client certificate
+/// and offers `alpn` protocols.
 fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
+    make_connector(alpn, Some((CLIENT_CERT_PATH, CLIENT_KEY_PATH)))
+}
+
+/// Make a TLS connector that trusts the dev CA and offers `alpn` protocols.
+/// `client_auth` is the certificate file and the key file of the client. With
+/// `None`, the connector sends no client certificate.
+fn make_connector(alpn: &[&[u8]], client_auth: Option<(&str, &str)>) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let certs = CertificateDer::pem_file_iter(CA_PATH)
         .expect("cannot read the CA. Run ./scripts/gen-dev-certs.sh first");
@@ -190,11 +217,23 @@ fn tls_connector(alpn: &[&[u8]]) -> TlsConnector {
             .expect("the CA certificate is not valid");
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("invalid protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    let mut config = match client_auth {
+        Some((cert_path, key_path)) => {
+            let certs = CertificateDer::pem_file_iter(cert_path)
+                .expect("cannot read the client certificate. Run ./scripts/gen-dev-certs.sh first")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("the client certificate file is not valid");
+            let key = PrivateKeyDer::from_pem_file(key_path).expect("cannot read the client key");
+            builder
+                .with_client_auth_cert(certs, key)
+                .expect("the client certificate does not match the key")
+        }
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
     TlsConnector::from(Arc::new(config))
 }
@@ -209,6 +248,35 @@ async fn connect(connector: &TlsConnector) -> TlsStream<tokio::net::TcpStream> {
         .connect(name, tcp)
         .await
         .expect("the TLS handshake failed")
+}
+
+/// Check that the proxy rejects the client of `connector` in the TLS handshake.
+///
+/// With TLS 1.3, the client can finish its side of the handshake before the
+/// server checks the client certificate. So the rejection can show when the
+/// client connects, or when it reads. In both cases the client gets no HTTP
+/// response. After that, a client with a valid certificate still works.
+async fn assert_rejected(connector: &TlsConnector) {
+    let tcp = tokio::net::TcpStream::connect(PROXY_ADDR)
+        .await
+        .expect("failed to connect to the proxy");
+    let name = ServerName::try_from("localhost").expect("not a valid name");
+    if let Ok(mut stream) = connector.connect(name, tcp).await {
+        let _ = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut reply = Vec::new();
+        let result = stream.read_to_end(&mut reply).await;
+        assert!(
+            result.is_err() || reply.is_empty(),
+            "the proxy answered a client with a bad certificate: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    // The upstream is not running, so a request that passes gets `502`.
+    let (status, _, _) = send(&client(), Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
 /// Send a request to the proxy with a valid `x-api-key`. Return the status,
@@ -499,13 +567,41 @@ async fn rejects_a_request_without_an_api_key_before_it_reaches_the_upstream() {
     let _proxy = Program::start("proxy", PROXY_ADDR).await;
     let client = client();
 
-    let (status, headers, body) = send_raw(&client, Method::GET, "/", &[], "").await;
+    let (status, _, body) = send_raw(&client, Method::GET, "/", &[], "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(headers["content-type"], "application/json");
-    assert_eq!(&body[..], br#"{"message": "Unauthorized"}"#);
+    assert!(body.is_empty());
 
     let (status, _, _) = send_raw(&client, Method::GET, "/", &[("x-api-key", "")], "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_client_without_a_certificate() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    assert_rejected(&make_connector(&[b"http/1.1"], None)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_a_client_certificate_from_an_untrusted_ca() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let connector = make_connector(
+        &[b"http/1.1"],
+        Some((UNTRUSTED_CERT_PATH, UNTRUSTED_KEY_PATH)),
+    );
+
+    assert_rejected(&connector).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rejects_an_expired_client_certificate() {
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let connector = make_connector(&[b"http/1.1"], Some((EXPIRED_CERT_PATH, EXPIRED_KEY_PATH)));
+
+    assert_rejected(&connector).await;
 }
 
 #[tokio::test]
@@ -565,7 +661,7 @@ async fn keeps_running_after_a_plain_http_request_to_the_tls_port() {
 #[tokio::test]
 #[serial]
 async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
-    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY"] {
+    for missing in ["PROXY_TLS_CERT", "PROXY_TLS_KEY", "PROXY_CLIENT_CA"] {
         // The program must stop before it binds, so it needs no free port.
         let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
             .arg("proxy")
@@ -573,6 +669,7 @@ async fn exits_with_code_1_when_a_tls_variable_is_not_set() {
             .env("SERVER_ADDR", SERVER_ADDR)
             .env("PROXY_TLS_CERT", CERT_PATH)
             .env("PROXY_TLS_KEY", KEY_PATH)
+            .env("PROXY_CLIENT_CA", CA_PATH)
             .env_remove(missing)
             .output()
             .expect("failed to run the program");

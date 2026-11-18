@@ -55,7 +55,8 @@ async fn main() -> Result<(), Error> {
         Command::Proxy => {
             // Check the TLS setup before the bind. A wrong setup stops the proxy at once.
             let (cert_path, key_path) = config.tls_paths()?;
-            let tls_config = tls::server_config(cert_path, key_path)?;
+            let client_ca_path = config.client_ca()?;
+            let tls_config = tls::server_config(cert_path, key_path, client_ca_path)?;
             let acceptor = TlsAcceptor::from(Arc::new(tls_config));
             let listener = bind(config.proxy_addr()).await?;
             proxy::serve(listener, shutdown, acceptor, config.server_addr()).await
