@@ -3,6 +3,7 @@
 //! This mode has its own accept loop. It does not share code with the `server` mode.
 
 use crate::SERVER_ADDR;
+use crate::headers;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -116,7 +117,9 @@ fn spawn_connection(
 
 /// Send `request` to `upstream` (a `host:port` address) and return the response.
 ///
-/// Keep the method, the headers, the path and the query. Stream both bodies.
+/// Keep the method, the path and the query. Stream both bodies. Remove the
+/// hop-by-hop headers from the request and from the response. Keep the other
+/// headers.
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     client: UpstreamClient,
@@ -137,9 +140,14 @@ async fn handle(
     *request.uri_mut() = uri;
     // The connection to the upstream is HTTP/1, also when the client uses HTTP/2.
     *request.version_mut() = Version::HTTP_11;
+    headers::remove_hop_by_hop(request.headers_mut());
 
     match client.request(request).await {
-        Ok(response) => Ok(response.map(|body| body.boxed_unsync())),
+        Ok(response) => {
+            let (mut parts, body) = response.into_parts();
+            headers::remove_hop_by_hop(&mut parts.headers);
+            Ok(Response::from_parts(parts, body.boxed_unsync()))
+        }
         Err(err) => {
             warn!(%err, "request to the upstream failed");
             Ok(bad_gateway())

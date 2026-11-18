@@ -1,4 +1,5 @@
 mod errors;
+mod headers;
 mod proxy;
 mod server;
 
