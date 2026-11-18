@@ -1,7 +1,10 @@
 //! The policy: which client identity may send which requests.
 //! It has the same shape as an entry in the policy file (YAML).
 
+use hyper::Method;
 use serde::Deserialize;
+use serde::Deserializer;
+use serde::de::Error as _;
 use thiserror::Error;
 use yaml_schema::Engine;
 use yaml_schema::loader;
@@ -31,7 +34,8 @@ pub struct Policies {
 }
 
 /// Read the policy file (YAML) at `path`. The file must follow the schema.
-/// The check stops at the first problem.
+/// The check stops at the first problem. A method in the file can have any
+/// letter case.
 pub fn load(path: &str) -> Result<Policies, PolicyError> {
     let text = std::fs::read_to_string(path)?;
     check_schema(&text)?;
@@ -60,12 +64,20 @@ pub struct Policy {
     pub allow: Vec<Rule>,
 }
 
+/// Read a method in any letter case.
+fn method_from_any_case<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Method, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    Method::from_bytes(text.to_ascii_uppercase().as_bytes()).map_err(D::Error::custom)
+}
+
 /// One allowed request: a method and a path.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// The HTTP method, for example `GET`.
-    pub method: String,
+    /// The HTTP method. In the file it can have any letter case, for example
+    /// `GET` or `get`.
+    #[serde(deserialize_with = "method_from_any_case")]
+    pub method: Method,
     /// An exact path, or a prefix that ends with `/*`.
     pub path: String,
 }
@@ -74,7 +86,7 @@ impl Policies {
     /// Return `true` if `identity` (a SPIFFE ID) may send the request.
     /// An identity with no entry may send nothing. If an identity has more than
     /// one entry, it may send what any of them allows.
-    pub fn authorize(&self, identity: &str, method: &str, path: &str) -> bool {
+    pub fn authorize(&self, identity: &str, method: &Method, path: &str) -> bool {
         self.policies
             .iter()
             .filter(|policy| policy.identity == identity)
@@ -85,7 +97,7 @@ impl Policies {
 impl Policy {
     /// Return `true` if this identity may send the request.
     ///
-    /// A rule matches when the method is the same (exact, case-sensitive) and
+    /// A rule matches when the method is the same and
     /// the path matches. A rule path is one of:
     /// - an exact path, for example `/payments`;
     /// - a prefix that ends with `/*`, for example `/reports/*`. It matches
@@ -95,13 +107,13 @@ impl Policy {
     ///
     /// The query is not part of the path. A path that `is_valid_path` rejects
     /// never matches.
-    pub fn authorize(&self, method: &str, path: &str) -> bool {
+    pub fn authorize(&self, method: &Method, path: &str) -> bool {
         let path = without_query(path);
         is_valid_path(path)
             && self
                 .allow
                 .iter()
-                .any(|rule| rule.method == method && path_matches(&rule.path, path))
+                .any(|rule| rule.method == *method && path_matches(&rule.path, path))
     }
 }
 
@@ -178,7 +190,8 @@ mod tests {
         }
     }
 
-    const VALID: &str = "policies:\n- identity: spiffe://acme/agent\n  allow:\n  - method: GET\n    path: /a\n";
+    const VALID: &str =
+        "policies:\n- identity: spiffe://acme/agent\n  allow:\n  - method: GET\n    path: /a\n";
 
     #[test]
     fn the_schema_accepts_a_valid_file() {
@@ -207,13 +220,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn load_changes_the_methods_to_upper_case() {
+        let path = std::env::temp_dir().join(format!("policy-case-{}.yaml", std::process::id()));
+        std::fs::write(&path, VALID.replace("GET", "get")).unwrap();
+
+        let policies = load(path.to_str().unwrap());
+        std::fs::remove_file(&path).unwrap();
+
+        let policies = policies.unwrap();
+        assert_eq!(policies.policies[0].allow[0].method, Method::GET);
+        assert!(policies.authorize("spiffe://acme/agent", &Method::GET, "/a"));
+    }
+
     fn policy(rules: &[(&str, &str)]) -> Policy {
         Policy {
             identity: "spiffe://acme/prod/agent".to_owned(),
             allow: rules
                 .iter()
                 .map(|(method, path)| Rule {
-                    method: (*method).to_owned(),
+                    method: Method::from_bytes(method.as_bytes()).unwrap(),
                     path: (*path).to_owned(),
                 })
                 .collect(),
@@ -224,69 +250,69 @@ mod tests {
     fn allows_an_exact_method_and_path() {
         let policy = policy(&[("POST", "/payments")]);
 
-        assert!(policy.authorize("POST", "/payments"));
+        assert!(policy.authorize(&Method::POST, "/payments"));
     }
 
     #[test]
     fn denies_another_method() {
         let policy = policy(&[("POST", "/payments")]);
 
-        assert!(!policy.authorize("GET", "/payments"));
-        assert!(!policy.authorize("post", "/payments"));
+        assert!(!policy.authorize(&Method::GET, "/payments"));
+        assert!(!policy.authorize(&Method::from_bytes(b"post").unwrap(), "/payments"));
     }
 
     #[test]
     fn denies_another_path() {
         let policy = policy(&[("POST", "/payments")]);
 
-        assert!(!policy.authorize("POST", "/payments/1"));
-        assert!(!policy.authorize("POST", "/payment"));
-        assert!(!policy.authorize("POST", "/payments/"));
-        assert!(!policy.authorize("POST", "/Payments"));
+        assert!(!policy.authorize(&Method::POST, "/payments/1"));
+        assert!(!policy.authorize(&Method::POST, "/payment"));
+        assert!(!policy.authorize(&Method::POST, "/payments/"));
+        assert!(!policy.authorize(&Method::POST, "/Payments"));
     }
 
     #[test]
     fn denies_everything_without_rules() {
-        assert!(!policy(&[]).authorize("GET", "/"));
+        assert!(!policy(&[]).authorize(&Method::GET, "/"));
     }
 
     #[test]
     fn allows_when_any_rule_matches() {
         let policy = policy(&[("GET", "/a"), ("POST", "/b")]);
 
-        assert!(policy.authorize("GET", "/a"));
-        assert!(policy.authorize("POST", "/b"));
-        assert!(!policy.authorize("GET", "/b"));
+        assert!(policy.authorize(&Method::GET, "/a"));
+        assert!(policy.authorize(&Method::POST, "/b"));
+        assert!(!policy.authorize(&Method::GET, "/b"));
     }
 
     #[test]
     fn a_prefix_rule_matches_whole_segments() {
         let policy = policy(&[("GET", "/reports/*")]);
 
-        assert!(policy.authorize("GET", "/reports/1"));
-        assert!(policy.authorize("GET", "/reports/2024/q1"));
-        assert!(!policy.authorize("GET", "/reports"));
-        assert!(!policy.authorize("GET", "/reports/"));
-        assert!(!policy.authorize("GET", "/reports-old/1"));
-        assert!(!policy.authorize("GET", "/other/reports/1"));
-        assert!(!policy.authorize("POST", "/reports/1"));
+        assert!(policy.authorize(&Method::GET, "/reports/1"));
+        assert!(policy.authorize(&Method::GET, "/reports/2024/q1"));
+        assert!(!policy.authorize(&Method::GET, "/reports"));
+        assert!(!policy.authorize(&Method::GET, "/reports/"));
+        assert!(!policy.authorize(&Method::GET, "/reports-old/1"));
+        assert!(!policy.authorize(&Method::GET, "/other/reports/1"));
+        assert!(!policy.authorize(&Method::POST, "/reports/1"));
     }
 
     #[test]
     fn a_root_prefix_rule_matches_every_path_but_the_root() {
         let policy = policy(&[("GET", "/*")]);
 
-        assert!(policy.authorize("GET", "/a"));
-        assert!(!policy.authorize("GET", "/"));
+        assert!(policy.authorize(&Method::GET, "/a"));
+        assert!(!policy.authorize(&Method::GET, "/"));
     }
 
     #[test]
     fn the_query_is_not_part_of_the_path() {
         let policy = policy(&[("GET", "/reports/*"), ("POST", "/payments")]);
 
-        assert!(policy.authorize("POST", "/payments?x=1"));
-        assert!(policy.authorize("GET", "/reports/1?x=/../y"));
-        assert!(!policy.authorize("GET", "/reports?x=/1"));
+        assert!(policy.authorize(&Method::POST, "/payments?x=1"));
+        assert!(policy.authorize(&Method::GET, "/reports/1?x=/../y"));
+        assert!(!policy.authorize(&Method::GET, "/reports?x=/1"));
     }
 
     #[test]
@@ -306,7 +332,7 @@ mod tests {
             "reports/1",
             "",
         ] {
-            assert!(!policy.authorize("GET", path), "{path:?}");
+            assert!(!policy.authorize(&Method::GET, path), "{path:?}");
         }
     }
 
@@ -358,7 +384,7 @@ mod tests {
                 Policy {
                     identity: "spiffe://acme/prod/other".to_owned(),
                     allow: vec![Rule {
-                        method: "GET".to_owned(),
+                        method: Method::GET,
                         path: "/b".to_owned(),
                     }],
                 },
@@ -366,10 +392,10 @@ mod tests {
         };
         let agent = "spiffe://acme/prod/agent";
 
-        assert!(policies.authorize(agent, "GET", "/a"));
-        assert!(!policies.authorize(agent, "GET", "/b"));
-        assert!(policies.authorize("spiffe://acme/prod/other", "GET", "/b"));
-        assert!(!policies.authorize("spiffe://acme/prod/unknown", "GET", "/a"));
+        assert!(policies.authorize(agent, &Method::GET, "/a"));
+        assert!(!policies.authorize(agent, &Method::GET, "/b"));
+        assert!(policies.authorize("spiffe://acme/prod/other", &Method::GET, "/b"));
+        assert!(!policies.authorize("spiffe://acme/prod/unknown", &Method::GET, "/a"));
     }
 
     #[test]
@@ -379,7 +405,7 @@ mod tests {
         };
         let agent = "spiffe://acme/prod/agent";
 
-        assert!(policies.authorize(agent, "GET", "/a"));
-        assert!(policies.authorize(agent, "POST", "/b"));
+        assert!(policies.authorize(agent, &Method::GET, "/a"));
+        assert!(policies.authorize(agent, &Method::POST, "/b"));
     }
 }

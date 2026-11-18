@@ -202,7 +202,7 @@ where
         Some(identity)
             if !state
                 .policies
-                .authorize(&identity.to_string(), method.as_str(), &path) =>
+                .authorize(&identity.to_string(), &method, &path) =>
         {
             empty(StatusCode::FORBIDDEN)
         }
