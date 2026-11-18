@@ -2,17 +2,9 @@ mod errors;
 mod proxy;
 mod server;
 
-use bytes::Bytes;
 use clap::Parser;
 use clap::Subcommand;
 use errors::Error;
-use http_body_util::BodyExt;
-use http_body_util::Full;
-use hyper::Request;
-use hyper::Response;
-use hyper::StatusCode;
-use hyper::body::Incoming;
-use std::convert::Infallible;
 use std::sync::LazyLock;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -100,33 +92,4 @@ fn shutdown_on_ctrl_c() -> CancellationToken {
         }
     });
     token
-}
-
-/// Answer a request.
-///
-/// - `/echo`: send back the request headers and the request body.
-/// - Any other path: `200 OK` with the body `ok`.
-async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    if request.uri().path() == "/echo" {
-        return Ok(echo(request).await);
-    }
-    Ok(Response::new(Full::new(Bytes::from_static(b"ok\n"))))
-}
-
-/// Return `200 OK` with the same headers and the same body as the request.
-/// A request without a body (for example `GET`) gets an empty body.
-async fn echo(request: Request<Incoming>) -> Response<Full<Bytes>> {
-    let (parts, body) = request.into_parts();
-    let body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            warn!(%err, "failed to read the request body");
-            let mut response = Response::new(Full::new(Bytes::new()));
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            return response;
-        }
-    };
-    let mut response = Response::new(Full::new(body));
-    *response.headers_mut() = parts.headers;
-    response
 }
