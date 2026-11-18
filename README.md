@@ -39,7 +39,7 @@ upstream, in these cases:
 | Status | Case                                                            |
 | ------ | --------------------------------------------------------------- |
 | `401`  | The client certificate has no valid identity.                   |
-| `400`  | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, NUL. |
+| `400`  | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, `%00`, NUL. |
 | `403`  | The policy does not allow this identity to send this request.   |
 
 The proxy does not decode `%` sequences in the path. See

@@ -27,7 +27,7 @@ that the policy does not allow.
    - does not start with `/`;
    - has an empty segment (`//`), except one at the end (`/reports/`);
    - has a segment that is `.` or `..`;
-   - has a NUL character;
+   - has a NUL character, or `%00` (an encoded NUL);
    - has `%2f`, `%2e` or `%5c` in any letter case (an encoded `/`, `.` or `\`).
 3. The query (the part after `?`) is not part of the path. The policy ignores
    it.
@@ -42,8 +42,9 @@ The code is in `src/policy.rs`: `Policy::authorize` and `is_valid_path`.
 
 - The policy and the upstream always see the same bytes, so a client cannot
   hide a dot segment or a slash in an encoded form.
-- We reject the three encodings that can change the structure of the path. We
-  do not need a decoder, and there is no decoder to get wrong.
+- We reject the encodings that can change the structure of the path (`%2f`,
+  `%2e`, `%5c`) or cut it (`%00`). We do not need a decoder, and there is no
+  decoder to get wrong.
 - Other encoded characters stay as literal text. `/a%20b` is valid, and it
   matches only a rule that has `%20`. `/%61dmin` does not match a rule for
   `/admin`. The result is a `403`. This is safe, but it can surprise people.

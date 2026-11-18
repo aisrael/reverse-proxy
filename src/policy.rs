@@ -102,7 +102,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 /// part before `?`) must start with `/`, and must not have:
 /// - an empty segment (`//`), except one at the end (`/reports/`);
 /// - a segment that is `.` or `..`;
-/// - a NUL character;
+/// - a NUL character, or an encoded NUL (`%00`);
 /// - an encoded `/`, `.` or `\` (`%2f`, `%2e`, `%5c`, in any case).
 ///
 /// We never decode `%` sequences, so a client cannot hide a dot segment or a
@@ -116,7 +116,7 @@ pub fn is_valid_path(path: &str) -> bool {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    if ["%2f", "%2e", "%5c"]
+    if ["%2f", "%2e", "%5c", "%00"]
         .iter()
         .any(|code| lower.contains(code))
     {
@@ -243,6 +243,7 @@ mod tests {
             "/reports/%2E/1",
             "/reports/a%2fb",
             "/reports/a%5Cb",
+            "/reports/a%00b",
             "/reports/a\0b",
             "reports/1",
             "",
@@ -284,6 +285,7 @@ mod tests {
             "/a%2Fb",
             "/%2e%2e/b",
             "/a%5cb",
+            "/a%00b",
             "/a\0b",
         ] {
             assert!(!is_valid_path(path), "{path:?}");
