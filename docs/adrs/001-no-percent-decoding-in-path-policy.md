@@ -57,7 +57,8 @@ upstream reads the other. We remove each source of a second reading.
 | An encoded or raw NUL cuts the path in the upstream. | `400` for `%00` and for a NUL character. |
 | A dot segment moves the path (`/reports/../admin`). | `400` for a `.` or `..` segment. |
 | An empty segment (`//`) is merged by some upstreams. | `400` for an empty segment, except one at the end. |
-| A path without a leading `/` (an absolute URI or `*`) is read in another way. | `400` if the path does not start with `/`. |
+| A path without a leading `/` (`*`, or `echo`) is read in another way. | `400` if the path does not start with `/`. |
+| An absolute URI as the request target (`GET http://other/echo`). | hyper gives us the path part only, so the policy checks that part. The proxy ignores the host in the URI, and always sends the request to the configured upstream. |
 | A query changes what the upstream serves, or hides a path (`?x=/../`). | The policy ignores the query. It is never part of the match. |
 | A prefix that matches a part of a segment (`/reports-old` for `/reports/*`). | The prefix keeps its `/`, and a `*` matches whole segments only. |
 | A `*` in the middle of a rule (`/a/*/b`) or without `/` (`/reports*`) is read as a wildcard by the author, and as a literal by the matcher. | The proxy does not start. Only a trailing `/*` is a wildcard. |
