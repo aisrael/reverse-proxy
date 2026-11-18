@@ -114,7 +114,6 @@ impl Config {
 
     /// The path of the CA bundle file for the client certificates.
     /// Return an error if `PROXY_CLIENT_CA` is not set.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the TLS setup will use it"))]
     pub fn client_ca(&self) -> Result<&str, ConfigError> {
         self.client_ca
             .as_deref()
