@@ -28,6 +28,7 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -114,12 +115,17 @@ fn spawn_connection(
 /// Every request has a request ID. The upstream gets it in the request, and the
 /// client gets it in the response. Use the `X-Request-Id` of the client if it
 /// is valid. Otherwise make a new one.
+///
 /// Never return an error: a failure becomes a `502 Bad Gateway` response.
 async fn handle(
     state: Arc<AppState>,
     client_ip: IpAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
+    let started = Instant::now();
+    // Keep the method and the path for the log line. Never log the query.
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let prepared = prepare_request(&mut request, &state.upstream, client_ip);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
@@ -131,6 +137,14 @@ async fn handle(
             bad_gateway()
         }
     };
+    debug!(
+        %method,
+        %path,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        request_id = request_id.to_str().unwrap_or_default(),
+        "request done"
+    );
     response
         .headers_mut()
         .insert(headers::REQUEST_ID, request_id);
