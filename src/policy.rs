@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::Error as _;
 use thiserror::Error;
+use tracing::instrument;
 use yaml_schema::Engine;
 use yaml_schema::loader;
 
@@ -139,6 +140,7 @@ impl Policies {
     /// Return `true` if `identity` (a SPIFFE ID) may send the request.
     /// An identity with no entry may send nothing. If an identity has more than
     /// one entry, it may send what any of them allows.
+    #[instrument(name = "policy_check", skip_all)]
     pub fn authorize(&self, identity: &str, method: &Method, path: &str) -> bool {
         self.policies
             .iter()

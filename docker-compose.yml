@@ -1,0 +1,26 @@
+# Grafana, Tempo and Prometheus in one container. It collects the spans and the
+# metrics of the proxy, so you can see where a request spends its time.
+#
+# Start it:
+#
+#   docker compose up -d      (or: podman compose up -d)
+#
+# Then start the proxy, or a benchmark, with the endpoint (OTLP over HTTP):
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 cargo run -- proxy
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 cargo bench --bench custom_benchmark
+#
+# Open Grafana at http://localhost:3000 (user `admin`, password `admin`). In
+# Explore, choose the data source Tempo and run:
+#
+#   { resource.service.name = "reverse-proxy" }
+#
+# The container has no volume, so it loses its data when you remove it.
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm
+    container_name: otel-lgtm
+    ports:
+      - "3000:3000" # Grafana UI
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP (the proxy uses this port)

@@ -6,6 +6,7 @@
 use crate::identity::CertificateInfo;
 use hyper::Method;
 use tracing::info;
+use tracing::instrument;
 
 /// What the proxy decided for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +75,7 @@ pub struct Event<'a> {
 }
 
 /// Write `event` as an audit event. A field that is `None` is not in the output.
+#[instrument(name = "audit_write", skip_all)]
 pub fn record(event: &Event) {
     let certificate = event.certificate;
     let uri_sans = certificate.and_then(|info| join(&info.uri_sans));

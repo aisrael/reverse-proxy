@@ -48,10 +48,11 @@ enum Command {
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
-    logging::init();
+    // The logs need the tracer of the telemetry, so start the telemetry first.
+    let telemetry = Arc::new(Telemetry::init()?);
+    logging::init(telemetry.span_tracer());
 
     let config = Config::try_from_env()?;
-    let telemetry = Arc::new(Telemetry::init()?);
     let shutdown = shutdown_on_signal();
     match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {

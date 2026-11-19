@@ -126,6 +126,12 @@ impl Telemetry {
         ))
     }
 
+    /// The tracer for the `tracing` spans, or `None` if the spans are not
+    /// exported. Without an exporter, the proxy does not make these spans.
+    pub fn span_tracer(&self) -> Option<SdkTracer> {
+        is_exported("TRACES").then(|| self.tracer.clone())
+    }
+
     /// Telemetry that makes trace IDs and counts timeouts, and exports nothing.
     #[cfg(test)]
     pub fn without_export() -> Self {

@@ -50,7 +50,8 @@ export PROXY_MAX_REQUEST_BODY_BYTES="1048576"
 export PROXY_MAX_RESPONSE_BODY_BYTES="1048576"
 
 # Where the proxy sends spans and metrics (OTLP over HTTP). If you do not set
-# it, the proxy exports nothing. Example for a local collector:
+# it, the proxy exports nothing. `docker compose up -d` starts a local
+# collector (`grafana/otel-lgtm`) on this port. Example:
 # export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
 # The service name in the spans and metrics. The default is `reverse-proxy`.
 # export OTEL_SERVICE_NAME="reverse-proxy"

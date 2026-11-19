@@ -357,6 +357,57 @@ openssl x509 -in dev-certs/server.pem -noout -text | grep -A1 "Alternative Name"
 
 > **Warning:** Use these certificates for local development and tests only. Never trust the CA outside your own machine. Never commit a key. Git ignores `dev-certs/`.
 
+## Benchmarks
+
+There are two benchmarks in `benches/`. Both send `POST /echo` with a random body (letters and digits, 32 to 1024 bytes) over a connection that stays open. Each one measures the upstream alone, and the proxy in front of it. The difference is what the proxy adds. `benches/common.rs` has the code that they share.
+
+By default, a benchmark starts the `server` mode and the `proxy` mode itself, each on a free port. It uses the dev certificates (it makes them if they are missing or expired), and the policy of the tests. The programs write no audit events to the terminal, and the log level is `warn`. To use a stack that is already running, give both addresses (`host:port`).
+
+**Custom benchmark (percentiles).** It runs a warm-up and then a measurement for each number of callers. It reports the requests, the error rate, the requests per second, and the latency (min, p50, p90, p95, p99 and max). Then it reports what the proxy adds.
+
+```sh
+cargo bench --bench custom_benchmark
+cargo bench --bench custom_benchmark -- -C 1,10,100 --warmup-secs 5 --duration-secs 30 --seed 42
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--warmup-secs` | `5` | The seconds of warm-up before each measurement. The results of the warm-up are dropped. |
+| `--duration-secs` | `30` | The seconds of each measurement. |
+| `-C`, `--concurrency` | `1` | The numbers of callers (1 to 1000), separated by commas. Each caller has its own connection. |
+| `--seed` | none | The seed for the random bodies. Caller `i` uses the seed plus `i`. |
+| `--proxy-addr`, `--upstream-addr` | none | The addresses of a stack that is already running. Give both, or neither. |
+
+For hundreds of callers, raise the limit of open files first, for example `ulimit -n 4096`.
+
+**Criterion benchmark (regressions).** It sends one request at a time, and finds a change in the speed. Save a baseline, change the code, and compare:
+
+```sh
+cargo bench --bench criterion_benchmark -- --save-baseline before
+cargo bench --bench criterion_benchmark -- --baseline before
+```
+
+Criterion writes an HTML report to `target/criterion`. To use a stack that is already running, set `BENCH_PROXY_ADDR` and `BENCH_UPSTREAM_ADDR`.
+
+**See where the time goes.** The proxy has spans for the steps of a request. They go to OpenTelemetry only, and only if `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Without it, the proxy makes no spans. `docker-compose.yml` starts `grafana/otel-lgtm`, which collects the spans and the metrics:
+
+```sh
+docker compose up -d
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 cargo bench --bench custom_benchmark
+```
+
+Open Grafana at http://localhost:3000 (user `admin`, password `admin`). In Explore, choose the data source Tempo and run `{ resource.service.name = "reverse-proxy" }`. A benchmark that starts its own stack passes the variable to the proxy only. The upstream does not export.
+
+| Span | What it covers |
+| --- | --- |
+| `request` | One request in the proxy. It is the root, or a child of the span of the client. |
+| `header_filtering` | The change of the request headers and the URI. |
+| `policy_check` | The check of the policy. |
+| `upstream request` | The request to the upstream, to the response head. |
+| `audit_write` | The write of the audit event to STDOUT. |
+| `tls_handshake` | The TLS handshake of one connection. It has its own trace. |
+| `identity_extraction` | The read of the client certificate, once for each connection. It has its own trace. |
+
 ## Security considerations
 
 - **Default deny.** The policy lists what each identity may do. An identity that is not in the file gets `403`. A request without a valid identity gets `401` before any other check.

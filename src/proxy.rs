@@ -41,6 +41,7 @@ use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use opentelemetry::Context;
+use opentelemetry::trace::TraceContextExt;
 use rustls::ServerConnection;
 use std::convert::Infallible;
 use std::error::Error;
@@ -55,9 +56,14 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+use tracing::Span;
 use tracing::debug;
 use tracing::info;
+use tracing::info_span;
+use tracing::instrument;
 use tracing::warn;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Maximum time to wait for open connections to finish after a shutdown request.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,7 +156,9 @@ fn spawn_connection(
     let watcher = graceful.watcher();
     let telemetry = state.telemetry.clone();
     tokio::spawn(async move {
-        let stream = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+        let handshake = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+            .instrument(info_span!("tls_handshake"));
+        let stream = match handshake.await {
             Ok(Ok(stream)) => stream,
             Ok(Err(err)) => {
                 debug!(%peer, %err, "TLS handshake failed");
@@ -164,8 +172,12 @@ fn spawn_connection(
         };
         let client_ip = peer.ip();
         // Read the identity once. All requests of this connection share it.
-        let identity = client_identity(stream.get_ref().1, peer);
-        let certificate = client_certificate(stream.get_ref().1, peer).map(Arc::new);
+        let (identity, certificate) = info_span!("identity_extraction").in_scope(|| {
+            (
+                client_identity(stream.get_ref().1, peer),
+                client_certificate(stream.get_ref().1, peer).map(Arc::new),
+            )
+        });
         let service = service_fn(move |request| {
             handle(
                 state.clone(),
@@ -245,6 +257,17 @@ fn client_certificate(connection: &ServerConnection, peer: SocketAddr) -> Option
 /// `504 Gateway Timeout` response if the upstream does not answer in time, or a
 /// `408 Request Timeout` response if the client sends the request body too
 /// slowly.
+///
+/// The span `request` is the root of the spans of one request. If the client
+/// sent a valid `traceparent`, it is a child of the span of the client.
+#[instrument(
+    name = "request",
+    skip_all,
+    fields(
+        http.request.method = %request.method(),
+        http.response.status_code = tracing::field::Empty,
+    )
+)]
 async fn handle<B>(
     state: Arc<AppState<B>>,
     client_ip: IpAddr,
@@ -273,6 +296,20 @@ where
     // Read the trace context of the client before `prepare_request` removes it.
     let parent = state.telemetry.extract(request.headers());
     let mut trace_id = Telemetry::trace_id(&parent);
+    // Put the span of this request in the trace of the client. This does
+    // nothing if the spans are not exported.
+    let span = Span::current();
+    let _ = span.set_parent(parent.clone());
+    // The span of the upstream request is a child of this span, if the spans
+    // are exported. If not, it is a child of the span of the client.
+    let upstream_parent = {
+        let context = span.context();
+        if context.span().span_context().is_valid() {
+            context
+        } else {
+            parent
+        }
+    };
     let prepared = prepare_request(&mut request, &state.upstream, client_ip, &state.via_name);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
@@ -297,13 +334,13 @@ where
         Some(_) => {
             let response = match prepared {
                 Ok(()) => {
-                    let span = state.telemetry.start_upstream_span(
-                        &parent,
+                    let upstream_span = state.telemetry.start_upstream_span(
+                        &upstream_parent,
                         method.as_str(),
                         &state.upstream,
                     );
-                    trace_id = Telemetry::trace_id(&span);
-                    match forward(&state, request, started, span).await {
+                    trace_id = Telemetry::trace_id(&upstream_span);
+                    match forward(&state, request, started, upstream_span).await {
                         Ok(response) => {
                             upstream_status = Some(response.status().as_u16());
                             response
@@ -343,6 +380,7 @@ where
         trace_id: trace_id.as_deref(),
         latency_ms: started.elapsed().as_millis() as u64,
     });
+    span.record("http.response.status_code", response.status().as_u16());
     response
         .headers_mut()
         .insert(headers::REQUEST_ID, request_id);
@@ -363,6 +401,7 @@ where
 ///
 /// Keep the headers on the list of allowed headers.
 /// Return an error if the URI for the upstream is not valid.
+#[instrument(name = "header_filtering", skip_all)]
 fn prepare_request<B>(
     request: &mut Request<B>,
     upstream: &str,
