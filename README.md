@@ -2,6 +2,58 @@
 
 A reverse proxy, and a small web server to test it with.
 
+## Call Flow
+
+The proxy checks each request in this order. The first check that fails gives
+the answer. Both bodies stream. The proxy does not keep them in memory.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Proxy
+    participant U as Upstream
+
+    C->>P: TLS handshake with client certificate
+    Note over P: Check the chain, the dates and the trusted CA.<br/>No valid certificate: the handshake fails.
+    C->>P: HTTP request
+    Note over P: Take the SPIFFE ID from the URI SAN
+    alt no valid identity
+        P-->>C: 401
+    end
+    Note over P: Check the Via header
+    alt the request is a loop
+        P-->>C: 508
+    end
+    Note over P: Check the path
+    alt the path is not valid
+        P-->>C: 400
+    end
+    Note over P: Check the policy for the identity
+    alt the policy does not allow the request
+        P-->>C: 403
+    end
+    P->>U: Request (allowed headers only, body limit)
+    alt no response head in time
+        P-->>C: 504
+    else the response is too large
+        P-->>C: 502
+    else
+        U-->>P: Response
+        P-->>C: Response (allowed headers only, body limit)
+    end
+    Note over P: Write the audit event (STDOUT)
+```
+
+## Architectural Decisions
+
+The ADRs in `docs/adrs/` give the reason for each decision.
+
+- [ADR 001](docs/adrs/001-no-percent-decoding-in-path-policy.md): the policy checks the path as the client sent it, and does not decode `%` sequences.
+- [ADR 002](docs/adrs/002-headers-the-proxy-forwards.md): the proxy forwards only the headers on an allowlist, and it handles `Forwarded` and `X-Forwarded-*` on purpose.
+- [ADR 003](docs/adrs/003-reload-the-client-ca-bundle.md): the proxy reloads the client CA bundle while it runs, and keeps the old CAs if the new file is not valid.
+- [ADR 004](docs/adrs/004-timeouts-and-telemetry.md): the proxy has timeouts for the client and the upstream, and it exports OpenTelemetry spans and metrics.
+- [ADR 005](docs/adrs/005-body-size-limits-and-streaming.md): the proxy limits the request and response bodies, and it streams them without buffering.
+
 ## Configuration
 
 The program reads these environment variables once, at start. A variable that is
