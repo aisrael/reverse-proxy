@@ -81,11 +81,22 @@ handshake has already worked, so the proxy can write an audit event for it.
 | URI SAN is not a valid SPIFFE ID          | Application    | `401`             |
 | Valid identity that the policy denies     | Application    | `403`             |
 
-The proxy uses the SPIFFE ID only. It does not read the subject, the issuer, the
-serial number, the dates or the DNS SANs of the client certificate, and the
-audit event does not have them. The audit event has the identity. It never
-has the certificate. The proxy does not compare the trust domain of the
-identity to a list. The policy file decides which identities are allowed.
+`rustls` checks the chain, the signatures and the dates. Nothing checks the
+serial number, the subject, the issuer or the DNS SANs. The proxy uses the
+SPIFFE ID only, and does not compare the trust domain to a list. The policy file
+decides which identities are allowed.
+
+The proxy writes the other fields of the client certificate to the audit event
+(see "Audit events"): `cert_subject`, `cert_issuer`, `cert_serial` (hex),
+`cert_not_before`, `cert_not_after`, `cert_uri_sans` and `cert_dns_sans`. The
+proxy does not use them for a decision, and never writes the certificate
+itself. They can have names of people or systems, so give the audit log the same
+access control as the data that the proxy protects.
+
+The proxy reads the fields after the handshake works. A certificate that the TLS
+layer rejects (expired, not valid yet, untrusted) has no HTTP request and no
+audit event, so its fields are not recorded. See
+`docs/adrs/006-log-client-certificate-fields.md`.
 
 A certificate is checked in the handshake only. A connection that is open keeps
 working after its certificate expires, or after the CA is removed from the
@@ -100,6 +111,7 @@ The ADRs in `docs/adrs/` give the reason for each decision.
 - [ADR 003](docs/adrs/003-reload-the-client-ca-bundle.md): the proxy reloads the client CA bundle while it runs, and keeps the old CAs if the new file is not valid.
 - [ADR 004](docs/adrs/004-timeouts-and-telemetry.md): the proxy has timeouts for the client and the upstream, and it exports OpenTelemetry spans and metrics.
 - [ADR 005](docs/adrs/005-body-size-limits-and-streaming.md): the proxy limits the request and response bodies, and it streams them without buffering.
+- [ADR 006](docs/adrs/006-log-client-certificate-fields.md): the proxy writes the fields of the client certificate to the audit event, and does not use them for a decision.
 
 ## Configuration
 
@@ -285,6 +297,10 @@ change the audit events.
 | `timestamp`       | The time of the event (RFC 3339, UTC). Added by `tracing-subscriber`. |
 | `request_id`      | The `X-Request-Id` of the request (the client's, or a new one).   |
 | `identity`        | The SPIFFE ID of the client. Not present if there is none.       |
+| `cert_subject`, `cert_issuer` | The subject and the issuer of the client certificate. Not present if the client has no certificate that the proxy can read. |
+| `cert_serial`     | The serial number of the client certificate, in hexadecimal, with `:` between bytes. |
+| `cert_not_before`, `cert_not_after` | The validity of the client certificate (RFC 2822). |
+| `cert_uri_sans`, `cert_dns_sans` | All URI SANs and all DNS SANs, separated by `,`. Not present if there are none. |
 | `method`, `path`  | The method and the path. The query is never in the event.        |
 | `host`            | The `Host` header, as the client sent it. Not present if none.   |
 | `decision`        | `ALLOW` (sent to the upstream) or `DENY`.                        |
@@ -294,7 +310,8 @@ change the audit events.
 | `trace_id`        | The trace ID (32 hexadecimal digits). The ID of the client trace if the client sent a valid `traceparent`. Not present if the request has no trace (for example a `401`). |
 | `latency_ms`      | The time from the request to the response head, in milliseconds. |
 
-An event never has a header, a cookie, a body or a query.
+An event never has a header, a cookie, a body or a query. It never has the
+certificate itself.
 
 ## Container image
 

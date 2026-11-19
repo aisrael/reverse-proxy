@@ -3,6 +3,7 @@
 //! The event goes to STDOUT as one line of JSON. The other logs go to STDERR
 //! (see `logging`). The event never has a header, a cookie, a body or a query.
 
+use crate::identity::CertificateInfo;
 use hyper::Method;
 use tracing::info;
 
@@ -54,6 +55,9 @@ pub struct Event<'a> {
     pub request_id: &'a str,
     /// The SPIFFE ID of the client. `None` if the certificate has no valid one.
     pub identity: Option<&'a str>,
+    /// The other fields of the client certificate. `None` if the client has no
+    /// certificate that the proxy can read.
+    pub certificate: Option<&'a CertificateInfo>,
     pub method: &'a Method,
     /// The path of the request, without the query.
     pub path: &'a str,
@@ -71,10 +75,20 @@ pub struct Event<'a> {
 
 /// Write `event` as an audit event. A field that is `None` is not in the output.
 pub fn record(event: &Event) {
+    let certificate = event.certificate;
+    let uri_sans = certificate.and_then(|info| join(&info.uri_sans));
+    let dns_sans = certificate.and_then(|info| join(&info.dns_sans));
     info!(
         target: "audit",
         request_id = event.request_id,
         identity = event.identity,
+        cert_subject = certificate.map(|info| info.subject.as_str()),
+        cert_issuer = certificate.map(|info| info.issuer.as_str()),
+        cert_serial = certificate.map(|info| info.serial.as_str()),
+        cert_not_before = certificate.map(|info| info.not_before.as_str()),
+        cert_not_after = certificate.map(|info| info.not_after.as_str()),
+        cert_uri_sans = uri_sans.as_deref(),
+        cert_dns_sans = dns_sans.as_deref(),
         method = %event.method,
         path = event.path,
         host = event.host,
@@ -85,4 +99,27 @@ pub fn record(event: &Event) {
         trace_id = event.trace_id,
         latency_ms = event.latency_ms,
     );
+}
+
+/// Join the values with a comma. Return `None` if there is no value, so the
+/// field is not in the event.
+fn join(values: &[String]) -> Option<String> {
+    (!values.is_empty()).then(|| values.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_values_with_a_comma() {
+        let values = ["a.example".to_owned(), "b.example".to_owned()];
+
+        assert_eq!(join(&values).as_deref(), Some("a.example,b.example"));
+    }
+
+    #[test]
+    fn has_no_field_for_an_empty_list() {
+        assert_eq!(join(&[]), None);
+    }
 }

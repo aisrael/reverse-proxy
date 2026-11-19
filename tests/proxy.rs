@@ -911,6 +911,72 @@ async fn ctrl_c_stops_the_proxy_with_exit_code_0() {
 
 #[tokio::test]
 #[serial]
+async fn writes_the_fields_of_the_client_certificate_to_the_audit_event() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = client();
+    let (status, _, _) = send(&client, Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["identity"], "spiffe://acme/prod/payment-agent");
+    assert!(
+        event["cert_subject"]
+            .as_str()
+            .unwrap()
+            .contains("payment-agent"),
+        "{event}"
+    );
+    assert!(
+        !event["cert_issuer"].as_str().unwrap().is_empty(),
+        "{event}"
+    );
+    assert!(
+        !event["cert_serial"].as_str().unwrap().is_empty(),
+        "{event}"
+    );
+    assert!(!event["cert_not_before"].as_str().unwrap().is_empty());
+    assert!(!event["cert_not_after"].as_str().unwrap().is_empty());
+    assert_eq!(
+        event["cert_uri_sans"], "spiffe://acme/prod/payment-agent",
+        "{event}"
+    );
+    // The certificate has no DNS SAN, so the field is not in the event.
+    assert!(event.get("cert_dns_sans").is_none(), "{event}");
+    // The proxy never writes the certificate itself.
+    assert!(!proxy.stderr().contains("BEGIN CERTIFICATE"));
+}
+
+#[tokio::test]
+#[serial]
+async fn writes_the_certificate_fields_for_a_client_without_a_spiffe_id() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+    let connector = connector_for("no-uri-agent");
+    let stream = connect(&connector).await;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP handshake failed");
+    tokio::spawn(connection);
+    let request = Request::builder()
+        .uri("/")
+        .header(HOST, PROXY_ADDR)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].get("identity").is_none());
+    assert!(events[0]["cert_serial"].as_str().is_some(), "{}", events[0]);
+    assert!(events[0].get("cert_uri_sans").is_none());
+}
+
+#[tokio::test]
+#[serial]
 async fn sigterm_stops_the_proxy_with_exit_code_0() {
     let _server = Program::start("server", SERVER_ADDR).await;
     let mut proxy = Program::start("proxy", PROXY_ADDR).await;

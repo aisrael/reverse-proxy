@@ -8,6 +8,7 @@ use crate::audit::Event;
 use crate::audit::Reason;
 use crate::deadline::DeadlineBody;
 use crate::headers;
+use crate::identity::CertificateInfo;
 use crate::identity::Identity;
 use crate::limit::BodyTooLarge;
 use crate::limit::LimitBody;
@@ -164,8 +165,16 @@ fn spawn_connection(
         let client_ip = peer.ip();
         // Read the identity once. All requests of this connection share it.
         let identity = client_identity(stream.get_ref().1, peer);
-        let service =
-            service_fn(move |request| handle(state.clone(), client_ip, identity.clone(), request));
+        let certificate = client_certificate(stream.get_ref().1, peer).map(Arc::new);
+        let service = service_fn(move |request| {
+            handle(
+                state.clone(),
+                client_ip,
+                identity.clone(),
+                certificate.clone(),
+                request,
+            )
+        });
         // The connection borrows `builder`, so create it inside the task.
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
@@ -197,9 +206,25 @@ fn client_identity(connection: &ServerConnection, peer: SocketAddr) -> Option<Id
     }
 }
 
+/// Read the fields of the client certificate, for the audit event. The proxy
+/// does not use them for a decision. Return `None` if the client sent no
+/// certificate, or the certificate cannot be read.
+fn client_certificate(connection: &ServerConnection, peer: SocketAddr) -> Option<CertificateInfo> {
+    let certificate = connection.peer_certificates()?.first()?;
+    match CertificateInfo::from_certificate(certificate) {
+        Ok(info) => Some(info),
+        Err(err) => {
+            // Never log the certificate.
+            debug!(%peer, %err, "client certificate cannot be read");
+            None
+        }
+    }
+}
+
 /// Send `request` to the upstream of `state` and return the response.
 /// `client_ip` is the IP address of the client. `identity` is the identity of
-/// the client, if its certificate has a valid one.
+/// the client, if its certificate has a valid one. `certificate` has the other
+/// fields of the certificate. They go to the audit event only.
 ///
 /// Check the request, then forward it. The proxy answers with an empty body
 /// and does not connect to the upstream if:
@@ -224,6 +249,7 @@ async fn handle<B>(
     state: Arc<AppState<B>>,
     client_ip: IpAddr,
     identity: Option<Identity>,
+    certificate: Option<Arc<CertificateInfo>>,
     mut request: Request<B>,
 ) -> Result<Response<Body>, Infallible>
 where
@@ -307,6 +333,7 @@ where
     audit::record(&Event {
         request_id: request_id.to_str().unwrap_or_default(),
         identity: identity.as_deref(),
+        certificate: certificate.as_deref(),
         method: &method,
         path: &path,
         host: host.as_deref(),
@@ -593,7 +620,7 @@ mod tests {
         }
         let request = request.body(Full::new(Bytes::new())).unwrap();
 
-        match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
+        match handle(state, "192.0.2.7".parse().unwrap(), identity, None, request).await {
             Ok(response) => response,
             Err(never) => match never {},
         }
@@ -654,10 +681,11 @@ mod tests {
             .unwrap();
         let identity = Some(PAYMENT_AGENT.parse::<Identity>().unwrap());
 
-        let response = match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        };
+        let response =
+            match handle(state, "192.0.2.7".parse().unwrap(), identity, None, request).await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            };
 
         assert_rejection(response, StatusCode::LOOP_DETECTED).await;
     }
@@ -805,7 +833,7 @@ mod tests {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let identity = Some(PAYMENT_AGENT.parse::<Identity>().unwrap());
-        match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
+        match handle(state, "192.0.2.7".parse().unwrap(), identity, None, request).await {
             Ok(response) => response,
             Err(never) => match never {},
         }

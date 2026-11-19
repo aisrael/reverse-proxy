@@ -7,6 +7,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
+use x509_parser::time::ASN1Time;
 
 const SCHEME: &str = "spiffe://";
 
@@ -67,6 +68,66 @@ impl Identity {
         }
         uri.parse()
     }
+}
+
+/// The fields of a client certificate that go to the audit event. The proxy
+/// does not use them to decide anything.
+///
+/// The TLS layer checks the chain and the dates. See `docs/adrs/006-log-client-certificate-fields.md`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CertificateInfo {
+    /// The subject, for example `CN=payment-agent`.
+    pub subject: String,
+    /// The issuer.
+    pub issuer: String,
+    /// The serial number, in hexadecimal, with `:` between the bytes.
+    pub serial: String,
+    /// The start of the validity (NotBefore), RFC 2822.
+    pub not_before: String,
+    /// The end of the validity (NotAfter), RFC 2822.
+    pub not_after: String,
+    /// All the URI SANs, not only the SPIFFE ID.
+    pub uri_sans: Vec<String>,
+    /// All the DNS SANs.
+    pub dns_sans: Vec<String>,
+}
+
+impl CertificateInfo {
+    /// Read the fields from the certificate in `der` (DER format).
+    pub fn from_certificate(der: &[u8]) -> Result<Self, IdentityError> {
+        let (_, cert) =
+            parse_x509_certificate(der).map_err(|_| IdentityError::InvalidCertificate)?;
+        let mut uri_sans = Vec::new();
+        let mut dns_sans = Vec::new();
+        let san = cert
+            .subject_alternative_name()
+            .map_err(|_| IdentityError::InvalidCertificate)?;
+        if let Some(san) = san {
+            for name in &san.value.general_names {
+                match name {
+                    GeneralName::URI(uri) => uri_sans.push((*uri).to_owned()),
+                    GeneralName::DNSName(dns) => dns_sans.push((*dns).to_owned()),
+                    _ => {}
+                }
+            }
+        }
+        let validity = cert.validity();
+        Ok(Self {
+            subject: cert.subject().to_string(),
+            issuer: cert.issuer().to_string(),
+            serial: cert.raw_serial_as_string(),
+            not_before: format_time(&validity.not_before),
+            not_after: format_time(&validity.not_after),
+            uri_sans,
+            dns_sans,
+        })
+    }
+}
+
+/// Format a time as RFC 2822, for example `Wed, 01 Jan 2020 00:00:00 +0000`.
+fn format_time(time: &ASN1Time) -> String {
+    time.to_rfc2822()
+        .unwrap_or_else(|_| "(invalid time)".to_owned())
 }
 
 impl FromStr for Identity {
@@ -140,6 +201,42 @@ mod tests {
         let identity = Identity::from_certificate(&dev_cert("reporting-agent")).unwrap();
 
         assert_eq!(identity.to_string(), "spiffe://acme/prod/reporting-agent");
+    }
+
+    #[test]
+    fn reads_the_fields_of_a_client_certificate() {
+        let info = CertificateInfo::from_certificate(&dev_cert("payment-agent")).unwrap();
+
+        assert!(info.subject.contains("payment-agent"), "{}", info.subject);
+        assert!(!info.issuer.is_empty());
+        assert!(!info.serial.is_empty());
+        assert!(!info.not_before.is_empty());
+        assert!(!info.not_after.is_empty());
+        assert_ne!(info.not_before, info.not_after);
+        assert_eq!(info.uri_sans, ["spiffe://acme/prod/payment-agent"]);
+        assert!(info.dns_sans.is_empty());
+    }
+
+    #[test]
+    fn reads_the_dns_sans_of_a_server_certificate() {
+        let info = CertificateInfo::from_certificate(&dev_cert("server")).unwrap();
+
+        assert!(info.dns_sans.contains(&"localhost".to_owned()));
+        assert!(info.uri_sans.is_empty());
+    }
+
+    #[test]
+    fn reads_the_fields_of_a_certificate_without_a_uri_san() {
+        let info = CertificateInfo::from_certificate(&dev_cert("no-uri-agent")).unwrap();
+
+        assert!(info.uri_sans.is_empty());
+    }
+
+    #[test]
+    fn cannot_read_the_fields_of_bytes_that_are_not_a_certificate() {
+        let err = CertificateInfo::from_certificate(b"not a certificate").unwrap_err();
+
+        assert_eq!(err, IdentityError::InvalidCertificate);
     }
 
     #[test]
