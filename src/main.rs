@@ -52,7 +52,7 @@ async fn main() -> Result<(), Error> {
 
     let config = Config::try_from_env()?;
     let telemetry = Arc::new(Telemetry::init()?);
-    let shutdown = shutdown_on_ctrl_c();
+    let shutdown = shutdown_on_signal();
     match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {
             // Check the TLS setup and the policy before the bind. A wrong setup stops the proxy at once.
@@ -96,19 +96,54 @@ async fn bind(addr: &str) -> Result<TcpListener, Error> {
     Ok(listener)
 }
 
-/// Return a token that is cancelled when Ctrl+C arrives.
-/// The cancellation starts the graceful shutdown.
-fn shutdown_on_ctrl_c() -> CancellationToken {
+/// Return a token that is cancelled when Ctrl+C (SIGINT) or SIGTERM arrives.
+/// The cancellation starts the graceful shutdown. Container platforms send
+/// SIGTERM to stop a container.
+fn shutdown_on_signal() -> CancellationToken {
     let token = CancellationToken::new();
     tokio::spawn({
         let token = token.clone();
         async move {
-            match signal::ctrl_c().await {
-                Ok(()) => info!("Ctrl+C received, starting graceful shutdown"),
-                Err(err) => warn!(%err, "failed to listen for Ctrl+C"),
-            }
+            wait_for_stop_signal().await;
             token.cancel();
         }
     });
     token
+}
+
+/// Wait until Ctrl+C or SIGTERM arrives, and log which one it was.
+#[cfg(unix)]
+async fn wait_for_stop_signal() {
+    use tokio::signal::unix::SignalKind;
+    use tokio::signal::unix::signal;
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(err) => {
+            warn!(%err, "failed to listen for SIGTERM");
+            wait_for_ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        () = wait_for_ctrl_c() => {}
+        _ = terminate.recv() => info!("SIGTERM received, starting graceful shutdown"),
+    }
+}
+
+/// Wait until Ctrl+C arrives. There is no SIGTERM on this platform.
+#[cfg(not(unix))]
+async fn wait_for_stop_signal() {
+    wait_for_ctrl_c().await;
+}
+
+/// Wait until Ctrl+C arrives. If the program cannot listen for it, wait for ever.
+async fn wait_for_ctrl_c() {
+    match signal::ctrl_c().await {
+        Ok(()) => info!("Ctrl+C received, starting graceful shutdown"),
+        Err(err) => {
+            warn!(%err, "failed to listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
+    }
 }

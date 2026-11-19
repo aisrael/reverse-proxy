@@ -40,6 +40,12 @@ open, and the requests that are running, do not change. If the new file is not
 valid, the proxy writes a warning to STDERR and keeps the old CAs. The proxy does
 not resume TLS sessions. See `docs/adrs/003-reload-the-client-ca-bundle.md`.
 
+## Shutdown
+
+Both modes stop gracefully on Ctrl+C (SIGINT) and on SIGTERM. Container
+platforms send SIGTERM to stop a container. The program stops to accept new
+connections, lets the requests that are running finish, and exits with code 0.
+
 ## Policy
 
 The `proxy` mode checks every request against the policy file

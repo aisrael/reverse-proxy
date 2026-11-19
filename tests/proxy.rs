@@ -206,6 +206,17 @@ impl Program {
         assert!(status.success(), "kill failed ({status})");
     }
 
+    /// Send SIGTERM to the program. Container platforms use this signal to stop a
+    /// container.
+    fn terminate(&self) {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("failed to run kill");
+        assert!(status.success(), "kill failed ({status})");
+    }
+
     /// Wait until the program exits. Panic if it does not exit within `limit`.
     async fn wait_for_exit(&mut self, limit: Duration) -> ExitStatus {
         let deadline = Instant::now() + limit;
@@ -895,6 +906,24 @@ async fn ctrl_c_stops_the_proxy_with_exit_code_0() {
 
     let status = proxy.wait_for_exit(Duration::from_secs(5)).await;
     assert_eq!(status.code(), Some(0), "{}", proxy.stderr());
+    proxy.assert_not_listening();
+}
+
+#[tokio::test]
+#[serial]
+async fn sigterm_stops_the_proxy_with_exit_code_0() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let mut proxy = Program::start("proxy", PROXY_ADDR).await;
+    let client = client();
+    let (status, _, _) = send(&client, Method::GET, "/", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    drop(client);
+
+    proxy.terminate();
+
+    let status = proxy.wait_for_exit(Duration::from_secs(5)).await;
+    assert_eq!(status.code(), Some(0), "{}", proxy.stderr());
+    assert!(proxy.stderr().contains("SIGTERM received"));
     proxy.assert_not_listening();
 }
 

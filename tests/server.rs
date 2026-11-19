@@ -98,6 +98,17 @@ impl Server {
         assert!(status.success(), "kill failed ({status})");
     }
 
+    /// Send SIGTERM to the server. Container platforms use this signal to stop a
+    /// container.
+    fn terminate(&self) {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("failed to run kill");
+        assert!(status.success(), "kill failed ({status})");
+    }
+
     /// Wait until the server exits. Panic if it does not exit within `limit`.
     async fn wait_for_exit(&mut self, limit: Duration) -> ExitStatus {
         let deadline = Instant::now() + limit;
@@ -257,6 +268,21 @@ async fn writes_one_info_log_line_for_each_request() {
     // Never log the query or the other headers.
     assert!(!log.contains("query-secret"), "{log}");
     assert!(!log.contains("header-secret"), "{log}");
+}
+
+#[tokio::test]
+#[serial]
+async fn sigterm_stops_the_server_with_exit_code_0() {
+    let mut server = Server::start().await;
+
+    server.terminate();
+
+    let status = server.wait_for_exit(Duration::from_secs(5)).await;
+    assert_eq!(status.code(), Some(0), "{}", server.stderr());
+    assert!(
+        TcpStream::connect(ADDR).is_err(),
+        "the server still listens after SIGTERM"
+    );
 }
 
 #[tokio::test]
