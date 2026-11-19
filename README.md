@@ -15,7 +15,7 @@ The proxy sits in front of one upstream and lets only known clients reach it. On
 - **Operation.** It reloads the client CA bundle while it runs, and it stops gracefully on SIGINT and SIGTERM. A container image is available.
 - **Benchmarks.** Two benchmarks measure the latency that the proxy adds. See [`docs/benchmarks.md`](docs/benchmarks.md).
 
-To try it, see "Test it end to end". For the checks that the proxy makes, see "Call Flow".
+To try it, see [Test it end to end](#test-it-end-to-end). For the checks that the proxy makes, see [Call Flow](#call-flow).
 
 ## Call Flow
 
@@ -69,7 +69,7 @@ The proxy checks the client certificate in two places. The TLS layer (`rustls`, 
 - the certificate is expired, or not valid yet (NotBefore and NotAfter);
 - the certificate cannot be used for a client.
 
-The proxy does not check if a certificate is revoked (no CRL and no OCSP). To stop a client, remove its CA from the bundle (see "Configuration"), or remove the identity from the policy.
+The proxy does not check if a certificate is revoked (no CRL and no OCSP). To stop a client, remove its CA from the bundle (see [Configuration](#configuration)), or remove the identity from the policy.
 
 **Application.** After the handshake, the proxy reads the certificate of the client, once for each connection. The identity is the SPIFFE ID in the URI SAN. The certificate must have exactly one URI SAN, and it must be a valid SPIFFE ID: the `spiffe://` scheme, a trust domain, a path, and no user info, port, query or fragment. If not, every request on that connection gets `401`. The handshake has already worked, so the proxy can write an audit event for it.
 
@@ -85,7 +85,7 @@ The proxy does not check if a certificate is revoked (no CRL and no OCSP). To st
 
 `rustls` checks the chain, the signatures and the dates. Nothing checks the serial number, the subject, the issuer or the DNS SANs. The proxy uses the SPIFFE ID only, and does not compare the trust domain to a list. The policy file decides which identities are allowed.
 
-The proxy writes the other fields of the client certificate to the audit event (see "Audit events"): `cert_subject`, `cert_issuer`, `cert_serial` (hex), `cert_not_before`, `cert_not_after`, `cert_uri_sans` and `cert_dns_sans`. The proxy does not use them for a decision, and never writes the certificate itself. They can have names of people or systems, so give the audit log the same access control as the data that the proxy protects.
+The proxy writes the other fields of the client certificate to the audit event (see [Audit events](#audit-events)): `cert_subject`, `cert_issuer`, `cert_serial` (hex), `cert_not_before`, `cert_not_after`, `cert_uri_sans` and `cert_dns_sans`. The proxy does not use them for a decision, and never writes the certificate itself. They can have names of people or systems, so give the audit log the same access control as the data that the proxy protects.
 
 The proxy reads the fields after the handshake works. A certificate that the TLS layer rejects (expired, not valid yet, untrusted) has no HTTP request and no audit event, so its fields are not recorded. See `docs/adrs/006-log-client-certificate-fields.md`.
 
@@ -118,7 +118,7 @@ The program reads these environment variables once, at start. A variable that is
 | `PROXY_CLIENT_TIMEOUT_SECS` | `10` | `proxy` | How long the client has to send the request head, and then the request body, in seconds (a whole number, more than 0). After that, the client gets `408` (or the connection closes). |
 | `PROXY_UPSTREAM_TIMEOUT_SECS` | `10` | `proxy` | How long the proxy waits for the response head from the upstream, in seconds (a whole number, more than 0). After that, the client gets `504`. |
 | `PROXY_MAX_REQUEST_BODY_BYTES` | `1048576` (1 MiB) | `proxy` | The largest request body, in bytes (a whole number). `0` means no limit. A larger body gets `413`. |
-| `PROXY_MAX_RESPONSE_BODY_BYTES` | `1048576` (1 MiB) | `proxy` | The largest response body, in bytes (a whole number). `0` means no limit. See "Body size and streaming". |
+| `PROXY_MAX_RESPONSE_BODY_BYTES` | `1048576` (1 MiB) | `proxy` | The largest response body, in bytes (a whole number). `0` means no limit. See "Body size and streaming" in [Policy](#policy). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | `proxy` | The OTLP/HTTP endpoint for spans and metrics (for example `http://localhost:4318`). The proxy does not export if it is not set. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` set one signal only. |
 | `OTEL_SERVICE_NAME` | `reverse-proxy` | `proxy` | The service name in the spans and metrics. |
 | `RUST_LOG` | `info` | both | The log level of the logs on STDERR, for example `debug`. It does not change the audit events. |
@@ -149,7 +149,7 @@ The proxy answers with an empty body, and does not send the request to the upstr
 | `401` | The client certificate has no valid identity. |
 | `400` | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, `%00`, NUL. |
 | `403` | The policy does not allow this identity to send this request. |
-| `508` | The request came back to this proxy (a loop). See "Headers". |
+| `508` | The request came back to this proxy (a loop). See [Headers](#headers). |
 | `408` | The client does not send the request body within `PROXY_CLIENT_TIMEOUT_SECS`. The body is empty. |
 | `413` | The request body is larger than `PROXY_MAX_REQUEST_BODY_BYTES`. The body is empty. |
 | `502` | The response body is larger than `PROXY_MAX_RESPONSE_BODY_BYTES`, and the upstream said so in its head (`Content-Length`). The body is `Bad Gateway`. |
@@ -163,7 +163,7 @@ Timeouts:
 - **Upstream:** the upstream has `PROXY_UPSTREAM_TIMEOUT_SECS`, from the time that the proxy begins to forward the request, to send the response head. The time includes the connection and the sending of the request. After that, the client gets `504`. A slow client hits its own limit first, because the limits are 10 seconds by default and the client limit starts first.
 - **Not limited:** a response body that stops after its head, and the time that a connection is idle between requests.
 
-Each timeout adds 1 to a counter. See "OpenTelemetry".
+Each timeout adds 1 to a counter. See [OpenTelemetry](#opentelemetry).
 
 Body size and streaming:
 
@@ -179,7 +179,7 @@ The proxy does not decode `%` sequences in the path. See `docs/adrs/001-no-perce
 
 ## Headers
 
-The proxy sends only some request headers to the upstream: `Accept`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Encoding`, `Content-Length`, `Content-Type`, `If-Match`, `If-Modified-Since`, `If-None-Match`, `If-Unmodified-Since`, `Range`, `User-Agent`, `Via` and `X-Request-Id`. It removes all other request headers, for example `Authorization`, `Cookie` and custom headers. It sets `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself, and ignores the values that the client sent for them. It also sets `traceparent` and `tracestate` (see "OpenTelemetry"), and does not forward `baggage`. It keeps `Via` and adds its own name (`reverse-proxy-` and 8 random digits, new at each start). If a request already has this name in `Via`, it came back to the proxy: the proxy answers `508` and does not forward it. For a response, it removes the hop-by-hop headers (`Connection`, `Transfer-Encoding` and others) and forwards the rest. The list is `ALLOWED_REQUEST` in `src/headers.rs`. See `docs/adrs/002-headers-the-proxy-forwards.md`.
+The proxy sends only some request headers to the upstream: `Accept`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Encoding`, `Content-Length`, `Content-Type`, `If-Match`, `If-Modified-Since`, `If-None-Match`, `If-Unmodified-Since`, `Range`, `User-Agent`, `Via` and `X-Request-Id`. It removes all other request headers, for example `Authorization`, `Cookie` and custom headers. It sets `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself, and ignores the values that the client sent for them. It also sets `traceparent` and `tracestate` (see [OpenTelemetry](#opentelemetry)), and does not forward `baggage`. It keeps `Via` and adds its own name (`reverse-proxy-` and 8 random digits, new at each start). If a request already has this name in `Via`, it came back to the proxy: the proxy answers `508` and does not forward it. For a response, it removes the hop-by-hop headers (`Connection`, `Transfer-Encoding` and others) and forwards the rest. The list is `ALLOWED_REQUEST` in `src/headers.rs`. See `docs/adrs/002-headers-the-proxy-forwards.md`.
 
 ## OpenTelemetry
 
@@ -300,7 +300,7 @@ docker network rm proxy-test
 
 ## Test it end to end
 
-Make the test certificates (see "Local TLS setup"), then start the `server` and the `proxy` in two terminals. The proxy needs the TLS variables and `PROXY_POLICY_FILE=policies.yaml`:
+Make the test certificates (see [Local TLS setup](#local-tls-setup)), then start the `server` and the `proxy` in two terminals. The proxy needs the TLS variables and `PROXY_POLICY_FILE=policies.yaml`:
 
 ```sh
 cargo run -- server
@@ -431,7 +431,7 @@ Open Grafana at http://localhost:3000 (user `admin`, password `admin`). In Explo
 - **Path.** The policy checks the path as the client sent it. The proxy does not decode `%` sequences and does not normalize the path. It rejects `..`, `.`, `//`, `%2f`, `%2e`, `%5c` and `%00` with `400`. See `docs/adrs/001-no-percent-decoding-in-path-policy.md`.
 - **Headers.** The proxy forwards only the request headers on an allowlist. `Authorization`, `Cookie` and custom headers do not reach the upstream. The proxy sets `Host` and `X-Forwarded-*` itself, and ignores the values from the client. See `docs/adrs/002-headers-the-proxy-forwards.md`.
 - **Loops.** The proxy adds its name to `Via`. A request that already has it gets `508`.
-- **Limits.** The proxy has timeouts for the TLS handshake, the request head, the request body and the response head, and a size limit for each body. They protect the proxy from slow clients and large bodies. See "Policy".
+- **Limits.** The proxy has timeouts for the TLS handshake, the request head, the request body and the response head, and a size limit for each body. They protect the proxy from slow clients and large bodies. See [Policy](#policy).
 - **Audit events.** An event never has a header, a cookie, a body, a query or the certificate. It has names from the certificate, so give the audit log the same access control as the data that the proxy protects.
 - **Keys.** Mount the private key with the mode `600` or `400`. The container runs as a user that is not root. Never put a key in the image or in git.
 - **Image.** The runtime image is distroless. It has no shell and no package manager.
@@ -465,7 +465,7 @@ Open Grafana at http://localhost:3000 (user `admin`, password `admin`). In Explo
 ## Production considerations
 
 - **Certificates.** Use a real CA for the server certificate and for the clients. The files in `dev-certs/` are for local tests only. Plan the renewal of the server certificate: the proxy needs a restart to use a new one.
-- **Trust store.** The proxy reloads the CA bundle when the file changes. In a fleet, send the new bundle to all the instances. Mount the directory, not one file (see "Container image"), and add a new CA before you remove the old one. Instances that did not get the new bundle yet still trust the old CAs, and connections that are open do not change.
+- **Trust store.** The proxy reloads the CA bundle when the file changes. In a fleet, send the new bundle to all the instances. Mount the directory, not one file (see [Container image](#container-image)), and add a new CA before you remove the old one. Instances that did not get the new bundle yet still trust the old CAs, and connections that are open do not change.
 - **Revocation.** Because the proxy has no CRL or OCSP, use short-lived client certificates. Then a stolen key stops working soon.
 - **Network.** Put the proxy and the upstream in a private network. Allow only the proxy to reach the upstream. Open the proxy port only to the clients. If the network to the upstream is not trusted, add TLS with a sidecar or a service mesh, because the proxy does not do it.
 - **Policy changes.** A new policy needs a restart. Use a rolling restart, so that the service stays up. SIGTERM lets the requests that run finish. The proxy waits 10 seconds at most for open connections, so set the grace period of the platform to more than 10 seconds.
