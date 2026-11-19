@@ -389,6 +389,8 @@ cargo bench --bench criterion_benchmark -- --baseline before
 
 Criterion writes an HTML report to `target/criterion`. To use a stack that is already running, set `BENCH_PROXY_ADDR` and `BENCH_UPSTREAM_ADDR`.
 
+The results of a run, with charts, are in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 **See where the time goes.** The proxy has spans for the steps of a request. They go to OpenTelemetry only, and only if `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Without it, the proxy makes no spans. `docker-compose.yml` starts `grafana/otel-lgtm`, which collects the spans and the metrics:
 
 ```sh
