@@ -9,7 +9,7 @@ set must not be empty.
 
 | Variable         | Default          | Mode     | Meaning                                                    |
 | ---------------- | ---------------- | -------- | ---------------------------------------------------------- |
-| `PROXY_ADDR`     | `127.0.0.1:8080` | `proxy`  | The address (`host:port`) that the proxy listens on.       |
+| `PROXY_ADDR`     | `127.0.0.1:8443` | `proxy`  | The address (`host:port`) that the proxy listens on.       |
 | `SERVER_ADDR`    | `127.0.0.1:9000` | both     | The address of the `server` mode. The proxy sends its requests here. |
 | `PROXY_TLS_CERT` | none (required)  | `proxy`  | The path of the certificate file (PEM).                    |
 | `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
@@ -230,7 +230,7 @@ To send one request by hand:
 ```sh
 curl --cacert dev-certs/ca.pem \
   --cert dev-certs/payment-agent.pem --key dev-certs/payment-agent.key \
-  -X POST https://127.0.0.1:8080/payments
+  -X POST https://127.0.0.1:8443/payments
 ```
 
 ## Local TLS setup

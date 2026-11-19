@@ -4,8 +4,8 @@
 # To avoid this, use `reverse_proxy=debug`.
 export RUST_LOG="info"
 
-# The address (`host:port`) of the `proxy` mode. The default is `127.0.0.1:8080`.
-export PROXY_ADDR="127.0.0.1:8080"
+# The address (`host:port`) of the `proxy` mode. The default is `127.0.0.1:8443`.
+export PROXY_ADDR="127.0.0.1:8443"
 
 # The address (`host:port`) of the `server` mode. The proxy sends its requests to
 # this address. The default is `127.0.0.1:9000`.

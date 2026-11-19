@@ -59,7 +59,7 @@ pub struct Config {
 }
 
 /// The address of the `proxy` mode when `PROXY_ADDR` is not set.
-const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:8443";
 
 /// The address of the `server` mode when `SERVER_ADDR` is not set.
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:9000";
@@ -200,8 +200,8 @@ impl Config {
 
     /// Return an error if `SERVER_ADDR` is the same text as `PROXY_ADDR`.
     ///
-    /// This is a check of the text only. It does not know that `localhost:8080`
-    /// and `127.0.0.1:8080` are the same address. The `Via` header catches a
+    /// This is a check of the text only. It does not know that `localhost:8443`
+    /// and `127.0.0.1:8443` are the same address. The `Via` header catches a
     /// loop that this check does not see.
     pub fn check_upstream_is_not_proxy(&self) -> Result<(), ConfigError> {
         if self.server_addr == self.proxy_addr {

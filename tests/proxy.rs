@@ -44,7 +44,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 /// The address of the `proxy` mode.
-const PROXY_ADDR: &str = "127.0.0.1:8080";
+const PROXY_ADDR: &str = "127.0.0.1:8443";
 
 /// The address of the `server` mode (the upstream).
 const SERVER_ADDR: &str = "127.0.0.1:9000";

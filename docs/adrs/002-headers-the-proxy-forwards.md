@@ -80,8 +80,8 @@ The check comes after the identity check (`401`) and before the path check
 (`400`) and the policy check (`403`).
 
 The proxy also stops at start (exit code 1) if `SERVER_ADDR` and `PROXY_ADDR`
-are the same text. The check does not know that `localhost:8080` and
-`127.0.0.1:8080` are the same address.
+are the same text. The check does not know that `localhost:8443` and
+`127.0.0.1:8443` are the same address.
 
 A client can put any `Via` value in a request. It cannot cause a `508` for
 another client, because the name is random and the proxy never sends it to a

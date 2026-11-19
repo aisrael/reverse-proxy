@@ -7,7 +7,7 @@
 # `scripts/gen-dev-certs.sh`. To see the audit events, look at STDOUT of the proxy.
 #
 # Usage: scripts/send-test-requests.rb
-# Variables: PROXY_ADDR (default 127.0.0.1:8080), SERVER_ADDR (default 127.0.0.1:9000)
+# Variables: PROXY_ADDR (default 127.0.0.1:8443), SERVER_ADDR (default 127.0.0.1:9000)
 # Exit code: 0 if every answer has the expected status, 1 if not, 2 if the
 # setup is not ready (a program is not running, or a certificate is missing).
 
@@ -17,7 +17,7 @@ require "socket"
 
 ROOT = File.expand_path("..", __dir__)
 CERTS = File.join(ROOT, "dev-certs")
-PROXY_ADDR = ENV.fetch("PROXY_ADDR", "127.0.0.1:8080")
+PROXY_ADDR = ENV.fetch("PROXY_ADDR", "127.0.0.1:8443")
 SERVER_ADDR = ENV.fetch("SERVER_ADDR", "127.0.0.1:9000")
 
 def listening?(addr)
