@@ -197,6 +197,82 @@ change the audit events.
 
 An event never has a header, a cookie, a body or a query.
 
+## Container image
+
+The image has both modes. The default command is `proxy`. The command `server`
+runs the test upstream. The image has no certificate, key, CA or policy. Mount
+them when you run the container.
+
+Build the image:
+
+```sh
+docker build -t reverse-proxy .
+```
+
+Run it. `SERVER_ADDR` is the upstream (`host:port`, plain HTTP). It has no
+default in the image. The proxy listens on `0.0.0.0:8443` in the container.
+
+```sh
+docker run --rm -p 8443:8443 \
+  -e SERVER_ADDR=backend.internal:8080 \
+  -v "$PWD/tls:/etc/reverse-proxy/tls:ro" \
+  -v "$PWD/trust:/etc/reverse-proxy/trust:ro" \
+  -v "$PWD/policies.yaml:/etc/reverse-proxy/policies.yaml:ro" \
+  reverse-proxy
+```
+
+These are the files and the variables that find them:
+
+| File                | Path in the container                | Variable            |
+| ------------------- | ------------------------------------ | ------------------- |
+| Server certificate  | `/etc/reverse-proxy/tls/server.pem`  | `PROXY_TLS_CERT`    |
+| Server key          | `/etc/reverse-proxy/tls/server.key`  | `PROXY_TLS_KEY`     |
+| Client CA bundle    | `/etc/reverse-proxy/trust/ca.pem`    | `PROXY_CLIENT_CA`   |
+| Policy              | `/etc/reverse-proxy/policies.yaml`   | `PROXY_POLICY_FILE` |
+
+Mount the directory of the CA bundle, not only the file. The proxy reloads the
+CA when the file changes. A mount of one file can keep the old content when a
+tool replaces the file.
+
+### Test with the dev files
+
+This starts the `server` mode as the upstream, and the proxy in front of it. The
+proxy uses the dev certificates and `policies.yaml` from this repository. The
+image runs as a user that is not root, so `--user` lets it read the dev keys
+(mode `600`).
+
+```sh
+./scripts/gen-dev-certs.sh
+docker network create proxy-test
+
+docker run -d --name backend --network proxy-test \
+  -e SERVER_ADDR=0.0.0.0:9000 \
+  reverse-proxy server
+
+docker run -d --name proxy --network proxy-test \
+  --user "$(id -u):$(id -g)" -p 8443:8443 \
+  -e SERVER_ADDR=backend:9000 \
+  -e PROXY_TLS_CERT=/etc/reverse-proxy/dev/server.pem \
+  -e PROXY_TLS_KEY=/etc/reverse-proxy/dev/server.key \
+  -e PROXY_CLIENT_CA=/etc/reverse-proxy/dev/ca.pem \
+  -v "$PWD/dev-certs:/etc/reverse-proxy/dev:ro" \
+  -v "$PWD/policies.yaml:/etc/reverse-proxy/policies.yaml:ro" \
+  reverse-proxy
+
+curl --cacert dev-certs/ca.pem \
+  --cert dev-certs/payment-agent.pem --key dev-certs/payment-agent.key \
+  -X POST https://localhost:8443/payments
+```
+
+The answer is `200`. A `GET /payments` gives `403`, and a request without
+`--cert` fails the TLS handshake. `docker logs proxy` shows the audit events.
+To clean up:
+
+```sh
+docker stop proxy backend && docker rm proxy backend
+docker network rm proxy-test
+```
+
 ## Test it end to end
 
 Make the test certificates (see "Local TLS setup"), then start the `server` and
