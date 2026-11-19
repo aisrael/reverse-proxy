@@ -2,6 +2,21 @@
 
 A reverse proxy, and a small web server to test it with.
 
+## Overview
+
+The proxy sits in front of one upstream and lets only known clients reach it. One binary has two modes: `proxy` and `server` (the test upstream).
+
+- **Identity.** Clients use mutual TLS. The identity is the SPIFFE ID in the URI SAN of the client certificate. A request with no valid identity gets `401`.
+- **Policy.** A YAML file lists the methods and paths that each identity may use. The default is deny (`403`). The proxy rejects unsafe paths with `400`.
+- **Headers.** The proxy forwards only the request headers on an allowlist. It sets `Host`, `X-Forwarded-*` and the trace headers itself. It stops loops with `Via` (`508`).
+- **Limits.** The proxy has timeouts and body size limits. It streams both bodies and does not keep them in memory.
+- **Audit.** The proxy writes one JSON event for each request to STDOUT. Other logs go to STDERR.
+- **Telemetry.** The proxy sends OpenTelemetry spans and a timeout counter, if you set an endpoint.
+- **Operation.** It reloads the client CA bundle while it runs, and it stops gracefully on SIGINT and SIGTERM. A container image is available.
+- **Benchmarks.** Two benchmarks measure the latency that the proxy adds. See [`docs/benchmarks.md`](docs/benchmarks.md).
+
+To try it, see "Test it end to end". For the checks that the proxy makes, see "Call Flow".
+
 ## Call Flow
 
 The proxy checks each request in this order. The first check that fails gives the answer. Both bodies stream. The proxy does not keep them in memory.
