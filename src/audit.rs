@@ -64,6 +64,8 @@ pub struct Event<'a> {
     pub status: u16,
     /// The status from the upstream. `None` if the proxy got no response from it.
     pub upstream_status: Option<u16>,
+    /// The trace ID (32 hexadecimal digits). `None` if the request has no trace.
+    pub trace_id: Option<&'a str>,
     pub latency_ms: u64,
 }
 
@@ -80,6 +82,7 @@ pub fn record(event: &Event) {
         reason = event.decision.reason(),
         status = event.status,
         upstream_status = event.upstream_status,
+        trace_id = event.trace_id,
         latency_ms = event.latency_ms,
     );
 }

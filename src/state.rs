@@ -1,16 +1,32 @@
 //! The state that the proxy shares between all requests.
 
+use crate::deadline::DeadlineBody;
 use crate::headers;
 use crate::policy::Policies;
+use crate::telemetry::Telemetry;
 use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::error::Error;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// How long the proxy waits.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeouts {
+    /// How long the client has to send the request head, and then the request
+    /// body. Each has this time.
+    pub client: Duration,
+    /// How long to wait for the response head from the upstream. This includes
+    /// the connection, and the time to send the request.
+    pub upstream: Duration,
+}
 
 /// The client that sends requests to the upstream. `B` is the type of the
-/// request body.
-pub type UpstreamClient<B> = Client<HttpConnector, B>;
+/// request body that the proxy got from the client.
+pub type UpstreamClient<B> = Client<HttpConnector, DeadlineBody<B>>;
 
 /// The state that all requests share. Share it as `Arc<AppState>`.
 ///
@@ -26,20 +42,32 @@ pub struct AppState<B = Incoming> {
     /// The name of this proxy in the `Via` header. It is different for each
     /// start. A request with this name in its `Via` header is a loop.
     pub via_name: String,
+    /// How long to wait for the client and for the upstream.
+    pub timeouts: Timeouts,
+    /// The spans and the counter of timeouts.
+    pub telemetry: Arc<Telemetry>,
 }
 
 impl<B> AppState<B>
 where
-    B: Body + Send,
+    B: Body + Send + Unpin + 'static,
     B::Data: Send,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
 {
     /// Make the state for an upstream at `upstream` (a `host:port` address).
-    pub fn new(upstream: &str, policies: Policies) -> Self {
+    pub fn new(
+        upstream: &str,
+        policies: Policies,
+        timeouts: Timeouts,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         Self {
             client: Client::builder(TokioExecutor::new()).build_http(),
             upstream: upstream.to_string(),
             policies,
             via_name: headers::new_via_name(),
+            timeouts,
+            telemetry,
         }
     }
 }

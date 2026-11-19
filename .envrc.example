@@ -27,3 +27,19 @@ export PROXY_CLIENT_CA="dev-certs/ca.pem"
 # The path of the policy file (YAML) for the `proxy` mode. It says which client
 # identity may send which requests. There is no default. See `policies.yaml`.
 export PROXY_POLICY_FILE="policies.yaml"
+
+# How long the client has to send the request head, and then the request body,
+# in seconds. It must be a whole number, more than 0. After that, the client gets
+# `408` (or the connection closes). The default is `10`.
+export PROXY_CLIENT_TIMEOUT_SECS="10"
+
+# How long the proxy waits for the response head from the upstream, in seconds.
+# It must be a whole number, more than 0. After that, the client gets `504`.
+# The default is `10`.
+export PROXY_UPSTREAM_TIMEOUT_SECS="10"
+
+# Where the proxy sends spans and metrics (OTLP over HTTP). If you do not set
+# it, the proxy exports nothing. Example for a local collector:
+# export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
+# The service name in the spans and metrics. The default is `reverse-proxy`.
+# export OTEL_SERVICE_NAME="reverse-proxy"

@@ -1,5 +1,6 @@
 mod audit;
 mod config;
+mod deadline;
 mod errors;
 mod headers;
 mod identity;
@@ -9,6 +10,7 @@ mod proxy;
 mod reload;
 mod server;
 mod state;
+mod telemetry;
 mod tls;
 
 use clap::Parser;
@@ -16,6 +18,7 @@ use clap::Subcommand;
 use config::Config;
 use errors::Error;
 use std::sync::Arc;
+use telemetry::Telemetry;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_rustls::TlsAcceptor;
@@ -47,6 +50,7 @@ async fn main() -> Result<(), Error> {
     logging::init();
 
     let config = Config::try_from_env()?;
+    let telemetry = Arc::new(Telemetry::init()?);
     let shutdown = shutdown_on_ctrl_c();
     match cli.command.unwrap_or(Command::Proxy) {
         Command::Proxy => {
@@ -61,7 +65,16 @@ async fn main() -> Result<(), Error> {
             reload::watch_client_ca(client_ca_path, client_verifier, shutdown.clone())?;
             let acceptor = TlsAcceptor::from(Arc::new(tls_config));
             let listener = bind(config.proxy_addr()).await?;
-            proxy::serve(listener, shutdown, acceptor, config.server_addr(), policies).await
+            proxy::serve(
+                listener,
+                shutdown,
+                acceptor,
+                config.server_addr(),
+                policies,
+                config.timeouts(),
+                telemetry.clone(),
+            )
+            .await
         }
         Command::Server => {
             let listener = bind(config.server_addr()).await?;
@@ -69,6 +82,7 @@ async fn main() -> Result<(), Error> {
         }
     }
 
+    telemetry.shutdown();
     info!("shut down cleanly");
     Ok(())
 }

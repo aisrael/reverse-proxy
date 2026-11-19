@@ -110,6 +110,17 @@ impl Program {
 
     /// Start the program as `start` does, with the CA bundle file `client_ca`.
     async fn start_with_ca(mode: &str, addr: &'static str, client_ca: &str) -> Self {
+        Self::start_with(mode, addr, client_ca, &[]).await
+    }
+
+    /// Start the program as `start_with_ca` does, and set more environment
+    /// variables from `env`.
+    async fn start_with(
+        mode: &str,
+        addr: &'static str,
+        client_ca: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         assert!(
             TcpStream::connect(addr).is_err(),
             "another process uses {addr}. Stop it and run the tests again"
@@ -135,6 +146,7 @@ impl Program {
             .env("PROXY_TLS_KEY", KEY_PATH)
             .env("PROXY_CLIENT_CA", client_ca)
             .env("PROXY_POLICY_FILE", POLICY_PATH)
+            .envs(env.iter().copied())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -1176,4 +1188,180 @@ async fn reloads_the_ca_file_when_a_symbolic_link_changes() {
 
     wait_for_handshake(&untrusted, true, "the new CA is not trusted").await;
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Listen on the upstream address. The kernel accepts connections, and nothing
+/// reads or answers them.
+fn hang_as_upstream() -> std::net::TcpListener {
+    std::net::TcpListener::bind(SERVER_ADDR).expect("another process uses the upstream address")
+}
+
+#[tokio::test]
+#[serial]
+async fn answers_504_when_the_upstream_does_not_answer_in_time() {
+    let _upstream = hang_as_upstream();
+    let proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[("PROXY_UPSTREAM_TIMEOUT_SECS", "1")],
+    )
+    .await;
+
+    let started = Instant::now();
+    let (status, _, body) = send(&client(), Method::GET, "/", &[], "").await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(&body[..], b"Gateway Timeout");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let events = proxy.audit_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["decision"], "ALLOW");
+    assert_eq!(events[0]["status"], 504);
+    assert!(events[0].get("upstream_status").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn exits_with_code_1_when_the_upstream_timeout_is_not_a_number_of_seconds() {
+    let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
+        .arg("proxy")
+        .env("PROXY_UPSTREAM_TIMEOUT_SECS", "0")
+        .env("PROXY_TLS_CERT", CERT_PATH)
+        .env("PROXY_TLS_KEY", KEY_PATH)
+        .env("PROXY_CLIENT_CA", CA_PATH)
+        .env("PROXY_POLICY_FILE", POLICY_PATH)
+        .output()
+        .expect("failed to run the program");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("PROXY_UPSTREAM_TIMEOUT_SECS"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+
+#[tokio::test]
+#[serial]
+async fn sends_the_trace_id_of_the_client_to_the_upstream() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+    let traceparent = format!("00-{TRACE_ID}-b7ad6b7169203331-01");
+
+    let (status, headers, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[
+            ("traceparent", &traceparent),
+            ("tracestate", "vendor=value"),
+            ("baggage", "user=secret"),
+        ],
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Same trace, new span: the span of the proxy is the parent for the upstream.
+    let sent = headers["traceparent"].to_str().unwrap();
+    assert!(sent.starts_with(&format!("00-{TRACE_ID}-")), "got: {sent}");
+    assert!(!sent.contains("b7ad6b7169203331"), "got: {sent}");
+    assert_eq!(headers["tracestate"], "vendor=value");
+    assert!(!headers.contains_key("baggage"));
+    let events = proxy.audit_events();
+    assert_eq!(events[0]["trace_id"], TRACE_ID);
+}
+
+#[tokio::test]
+#[serial]
+async fn starts_a_new_trace_when_the_client_sends_no_valid_trace_context() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start("proxy", PROXY_ADDR).await;
+
+    let (_, none, _) = send(&client(), Method::GET, "/echo", &[], "").await;
+    let (_, bad, _) = send(
+        &client(),
+        Method::GET,
+        "/echo",
+        &[("traceparent", "not-valid")],
+        "",
+    )
+    .await;
+
+    let events = proxy.audit_events();
+    for (headers, event) in [none, bad].iter().zip(&events) {
+        let sent = headers["traceparent"].to_str().unwrap();
+        let trace_id = event["trace_id"].as_str().expect("no trace_id");
+        assert_eq!(trace_id.len(), 32);
+        assert!(sent.starts_with(&format!("00-{trace_id}-")), "got: {sent}");
+        assert!(!headers.contains_key("tracestate"));
+    }
+    assert_ne!(events[0]["trace_id"], events[1]["trace_id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn answers_408_when_the_client_sends_the_request_body_too_slowly() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[("PROXY_CLIENT_TIMEOUT_SECS", "1")],
+    )
+    .await;
+    let mut stream = connect(&client().connector).await;
+    // The request says that the body has 10 bytes. The client sends 3 and stops.
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc",
+        )
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+        .await
+        .expect("the proxy did not answer in time")
+        .ok();
+
+    assert!(
+        String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 408"),
+        "got: {}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let events = proxy.audit_events();
+    assert_eq!(events[0]["status"], 408);
+    assert!(events[0].get("upstream_status").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn closes_the_connection_of_a_client_that_sends_the_request_head_too_slowly() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[("PROXY_CLIENT_TIMEOUT_SECS", "1")],
+    )
+    .await;
+    let mut stream = connect(&client().connector).await;
+    // The head has no empty line at the end, so it is never complete.
+    stream
+        .write_all(b"GET /echo HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+
+    let mut reply = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply)).await;
+
+    assert!(result.is_ok(), "the proxy kept the connection open");
+    assert!(!String::from_utf8_lossy(&reply).contains("200 OK"));
 }

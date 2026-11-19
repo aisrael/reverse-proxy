@@ -1,6 +1,8 @@
 //! The configuration of the program. All environment variables are read here.
 
+use crate::state::Timeouts;
 use std::env::VarError;
+use std::time::Duration;
 
 /// An error in the configuration.
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +16,9 @@ pub enum ConfigError {
     /// The environment variable is set, but its value is empty.
     #[error("environment variable {0} is empty")]
     Empty(&'static str),
+    /// The environment variable must be a whole number of seconds, more than 0.
+    #[error("environment variable {name} must be a number of seconds, more than 0 (got {value:?})")]
+    NotSeconds { name: &'static str, value: String },
     /// `SERVER_ADDR` and `PROXY_ADDR` are the same address. The proxy would send
     /// every request to itself.
     #[error(
@@ -39,6 +44,10 @@ pub struct Config {
     client_ca: Option<String>,
     /// The path of the policy file (YAML). Only the `proxy` mode needs it.
     policy_file: Option<String>,
+    /// How long the proxy waits for the client to send the request.
+    client_timeout: Duration,
+    /// How long the proxy waits for the response head from the upstream.
+    upstream_timeout: Duration,
 }
 
 /// The address of the `proxy` mode when `PROXY_ADDR` is not set.
@@ -46,6 +55,27 @@ const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:8080";
 
 /// The address of the `server` mode when `SERVER_ADDR` is not set.
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:9000";
+
+/// The time that the proxy waits for the client, and for the upstream, when
+/// `PROXY_CLIENT_TIMEOUT_SECS` and `PROXY_UPSTREAM_TIMEOUT_SECS` are not set.
+const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// Read an environment variable that is a number of seconds.
+///
+/// Return `default_secs` if the variable is not set. If the variable is set, it
+/// must be a whole number, more than 0.
+fn try_read_secs_from_env_with_default(
+    name: &'static str,
+    default_secs: u64,
+) -> Result<Duration, ConfigError> {
+    let Some(value) = try_read_optional_from_env(name)? else {
+        return Ok(Duration::from_secs(default_secs));
+    };
+    match value.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(ConfigError::NotSeconds { name, value }),
+    }
+}
 
 /// Read an environment variable that is required.
 ///
@@ -94,6 +124,14 @@ impl Config {
             tls_key: try_read_optional_from_env("PROXY_TLS_KEY")?,
             client_ca: try_read_optional_from_env("PROXY_CLIENT_CA")?,
             policy_file: try_read_optional_from_env("PROXY_POLICY_FILE")?,
+            client_timeout: try_read_secs_from_env_with_default(
+                "PROXY_CLIENT_TIMEOUT_SECS",
+                DEFAULT_TIMEOUT_SECS,
+            )?,
+            upstream_timeout: try_read_secs_from_env_with_default(
+                "PROXY_UPSTREAM_TIMEOUT_SECS",
+                DEFAULT_TIMEOUT_SECS,
+            )?,
         })
     }
 
@@ -105,6 +143,14 @@ impl Config {
     /// The address (`host:port`) of the `server` mode.
     pub fn server_addr(&self) -> &str {
         &self.server_addr
+    }
+
+    /// The timeouts of the proxy.
+    pub fn timeouts(&self) -> Timeouts {
+        Timeouts {
+            client: self.client_timeout,
+            upstream: self.upstream_timeout,
+        }
     }
 
     /// Return an error if `SERVER_ADDR` is the same text as `PROXY_ADDR`.
@@ -172,7 +218,61 @@ mod tests {
             tls_key: tls_key.map(Into::into),
             client_ca: None,
             policy_file: None,
+            client_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            upstream_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         }
+    }
+
+    #[test]
+    fn timeouts_are_10_seconds_by_default() {
+        let timeouts = config(None, None).timeouts();
+
+        assert_eq!(timeouts.client, Duration::from_secs(10));
+        assert_eq!(timeouts.upstream, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn secs_returns_the_default_when_not_set() {
+        let value = try_read_secs_from_env_with_default("CONFIG_TEST_SECS_NOT_SET", 7).unwrap();
+
+        assert_eq!(value, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn secs_returns_the_value_when_set() {
+        set("CONFIG_TEST_SECS_SET", "12");
+
+        let value = try_read_secs_from_env_with_default("CONFIG_TEST_SECS_SET", 7).unwrap();
+
+        assert_eq!(value, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn secs_fails_for_zero_and_for_text() {
+        for (name, value) in [
+            ("CONFIG_TEST_SECS_ZERO", "0"),
+            ("CONFIG_TEST_SECS_TEXT", "soon"),
+            ("CONFIG_TEST_SECS_NEGATIVE", "-1"),
+            ("CONFIG_TEST_SECS_FRACTION", "1.5"),
+        ] {
+            set(name, value);
+
+            let err = try_read_secs_from_env_with_default(name, 7).unwrap_err();
+
+            assert!(
+                matches!(&err, ConfigError::NotSeconds { value: got, .. } if got == value),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn secs_fails_when_empty() {
+        set("CONFIG_TEST_SECS_EMPTY", "");
+
+        let err = try_read_secs_from_env_with_default("CONFIG_TEST_SECS_EMPTY", 7).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Empty(_)), "got: {err}");
     }
 
     #[test]

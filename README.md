@@ -15,11 +15,16 @@ set must not be empty.
 | `PROXY_TLS_KEY`  | none (required)  | `proxy`  | The path of the private key file (PEM).                    |
 | `PROXY_CLIENT_CA` | none (required) | `proxy`  | The path of the CA bundle file (PEM) that signs the client certificates. The proxy reloads it when it changes. |
 | `PROXY_POLICY_FILE` | none (required) | `proxy` | The path of the policy file (YAML). See `policies.yaml`. |
+| `PROXY_CLIENT_TIMEOUT_SECS` | `10` | `proxy` | How long the client has to send the request head, and then the request body, in seconds (a whole number, more than 0). After that, the client gets `408` (or the connection closes). |
+| `PROXY_UPSTREAM_TIMEOUT_SECS` | `10` | `proxy` | How long the proxy waits for the response head from the upstream, in seconds (a whole number, more than 0). After that, the client gets `504`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | `proxy` | The OTLP/HTTP endpoint for spans and metrics (for example `http://localhost:4318`). The proxy does not export if it is not set. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` set one signal only. |
+| `OTEL_SERVICE_NAME` | `reverse-proxy` | `proxy` | The service name in the spans and metrics. |
 | `RUST_LOG`       | `info`           | both     | The log level of the logs on STDERR, for example `debug`. It does not change the audit events. |
 
 The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT`,
 `PROXY_TLS_KEY`, `PROXY_CLIENT_CA` or `PROXY_POLICY_FILE` is not set, if a
-file cannot be read or is not valid, or if `SERVER_ADDR` is the same text as
+file cannot be read or is not valid, if `PROXY_CLIENT_TIMEOUT_SECS` or
+`PROXY_UPSTREAM_TIMEOUT_SECS` is not a whole number of seconds, more than 0, or if `SERVER_ADDR` is the same text as
 `PROXY_ADDR`.
 The `server` mode does not use the TLS variables.
 
@@ -61,6 +66,28 @@ upstream, in these cases:
 | `400`  | The path is not valid: `..`, `.`, `//`, `%2f`, `%2e`, `%5c`, `%00`, NUL. |
 | `403`  | The policy does not allow this identity to send this request.   |
 | `508`  | The request came back to this proxy (a loop). See "Headers".    |
+| `408`  | The client does not send the request body within `PROXY_CLIENT_TIMEOUT_SECS`. The body is empty. |
+| `502`  | The proxy cannot connect to the upstream, or the upstream fails before it sends a response head. The body is `Bad Gateway`. |
+| `504`  | The upstream sends no response head within `PROXY_UPSTREAM_TIMEOUT_SECS`. The body is `Gateway Timeout`. |
+
+Timeouts:
+
+- **Client head (HTTP/1):** the client has `PROXY_CLIENT_TIMEOUT_SECS` to send
+  the request head. After that, the proxy closes the connection. HTTP/2 has no
+  such limit in the proxy.
+- **Client body:** the client has `PROXY_CLIENT_TIMEOUT_SECS`, from the time
+  that the proxy has the request head, to send the whole body. After that, the
+  proxy stops the request to the upstream and answers `408`. The limit is for
+  the whole body, not for each chunk.
+- **Upstream:** the upstream has `PROXY_UPSTREAM_TIMEOUT_SECS`, from the time
+  that the proxy begins to forward the request, to send the response head. The
+  time includes the connection and the sending of the request. After that, the
+  client gets `504`. A slow client hits its own limit first, because the
+  limits are 10 seconds by default and the client limit starts first.
+- **Not limited:** a response body that stops after its head, and the time
+  that a connection is idle between requests.
+
+Each timeout adds 1 to a counter. See "OpenTelemetry".
 
 The proxy does not decode `%` sequences in the path. See
 `docs/adrs/001-no-percent-decoding-in-path-policy.md`.
@@ -74,13 +101,37 @@ The proxy sends only some request headers to the upstream: `Accept`,
 `X-Request-Id`. It removes all other request headers, for example
 `Authorization`, `Cookie` and custom headers. It sets `Host`,
 `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself, and
-ignores the values that the client sent for them. It keeps `Via` and adds its
+ignores the values that the client sent for them. It also sets `traceparent`
+and `tracestate` (see "OpenTelemetry"), and does not forward `baggage`. It keeps `Via` and adds its
 own name (`reverse-proxy-` and 8 random digits, new at each start). If a request
 already has this name in `Via`, it came back to the proxy: the proxy answers
 `508` and does not forward it. For a response, it
 removes the hop-by-hop headers (`Connection`, `Transfer-Encoding` and others)
 and forwards the rest. The list is `ALLOWED_REQUEST` in `src/headers.rs`. See
 `docs/adrs/002-headers-the-proxy-forwards.md`.
+
+## OpenTelemetry
+
+The proxy makes one span for each request that it sends to the upstream. The
+span is `upstream request` (kind `client`). It has the attributes
+`http.request.method`, `server.address`, `server.port`,
+`http.response.status_code` and, for a failure, `error.type` (`timeout`,
+`client_timeout`, `connection` or a `5xx` status). It never has the query, a
+header or the identity of the client. The span ends when the response head
+arrives, or when the request fails.
+
+The proxy keeps the trace of the client. If the request has a valid W3C
+`traceparent`, the span is a child of it, with the same trace ID. If not, the
+proxy starts a new trace. The upstream gets `traceparent` (with the ID of the
+span of the proxy) and `tracestate`. The proxy ignores any other value.
+
+The counter `reverse_proxy.timeouts` adds 1 for each timeout. Its attribute
+`timeout.kind` is `upstream`, `client_body`, `client_header` (HTTP/1) or
+`handshake` (the TLS handshake).
+
+The proxy sends spans and metrics (OTLP over HTTP) only if you set
+`OTEL_EXPORTER_OTLP_ENDPOINT`. Without it, the proxy still makes trace IDs and
+counts, and exports nothing. See `docs/adrs/004-timeouts-and-telemetry.md`.
 
 ## Audit events
 
@@ -103,6 +154,7 @@ change the audit events.
 | `reason`          | Only for `DENY`: `no_identity`, `invalid_path`, `policy` or `loop`. |
 | `status`          | The status that the client got.                                  |
 | `upstream_status` | The status from the upstream. Not present if the proxy did not get a response from it (a `DENY`, or a `502`). |
+| `trace_id`        | The trace ID (32 hexadecimal digits). The ID of the client trace if the client sent a valid `traceparent`. Not present if the request has no trace (for example a `401`). |
 | `latency_ms`      | The time from the request to the response head, in milliseconds. |
 
 An event never has a header, a cookie, a body or a query.

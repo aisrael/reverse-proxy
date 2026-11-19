@@ -6,11 +6,16 @@ use crate::audit;
 use crate::audit::Decision;
 use crate::audit::Event;
 use crate::audit::Reason;
+use crate::deadline::DeadlineBody;
 use crate::headers;
 use crate::identity::Identity;
 use crate::policy;
 use crate::policy::Policies;
 use crate::state::AppState;
+use crate::state::Timeouts;
+use crate::telemetry::SpanOutcome;
+use crate::telemetry::Telemetry;
+use crate::telemetry::TimeoutKind;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Empty;
@@ -28,14 +33,17 @@ use hyper::http::uri::InvalidUri;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
+use opentelemetry::Context;
 use rustls::ServerConnection;
 use std::convert::Infallible;
 use std::error::Error;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -61,6 +69,8 @@ type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 /// Every connection uses TLS: `acceptor` does the handshake.
 /// The requests go to the upstream at `upstream` (a `host:port` address).
 /// `policies` say which client identity may send which requests.
+/// `timeouts` say how long to wait for the client and for the upstream.
+/// `telemetry` has the spans and the counter of timeouts.
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
@@ -70,10 +80,18 @@ pub async fn serve(
     acceptor: TlsAcceptor,
     upstream: &str,
     policies: Policies,
+    timeouts: Timeouts,
+    telemetry: Arc<Telemetry>,
 ) {
-    let state = Arc::new(AppState::new(upstream, policies));
+    let state = Arc::new(AppState::new(upstream, policies, timeouts, telemetry));
     info!(upstream = %state.upstream, "sending requests to the upstream");
-    let builder = Builder::new(TokioExecutor::new());
+    let mut builder = Builder::new(TokioExecutor::new());
+    // HTTP/1: close a connection that does not send the request head in time.
+    // HTTP/2 has no such setting.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(timeouts.client);
     let graceful = GracefulShutdown::new();
 
     loop {
@@ -121,6 +139,7 @@ fn spawn_connection(
     let builder = builder.clone();
     let acceptor = acceptor.clone();
     let watcher = graceful.watcher();
+    let telemetry = state.telemetry.clone();
     tokio::spawn(async move {
         let stream = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
             Ok(Ok(stream)) => stream,
@@ -130,6 +149,7 @@ fn spawn_connection(
             }
             Err(_) => {
                 debug!(%peer, "TLS handshake timed out");
+                state.telemetry.record_timeout(TimeoutKind::Handshake);
                 return;
             }
         };
@@ -142,6 +162,12 @@ fn spawn_connection(
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         // `watch` tells the connection to finish its work when the shutdown starts.
         if let Err(err) = watcher.watch(connection).await {
+            if err
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_timeout)
+            {
+                telemetry.record_timeout(TimeoutKind::ClientHeader);
+            }
             debug!(%peer, %err, "connection error");
         }
         debug!(%peer, "connection closed");
@@ -182,7 +208,10 @@ fn client_identity(connection: &ServerConnection, peer: SocketAddr) -> Option<Id
 /// client gets it in the response. Use the `X-Request-Id` of the client if it
 /// is valid. Otherwise make a new one.
 ///
-/// Never return an error: a failure becomes a `502 Bad Gateway` response.
+/// Never return an error: a failure becomes a `502 Bad Gateway` response, a
+/// `504 Gateway Timeout` response if the upstream does not answer in time, or a
+/// `408 Request Timeout` response if the client sends the request body too
+/// slowly.
 async fn handle<B>(
     state: Arc<AppState<B>>,
     client_ip: IpAddr,
@@ -207,6 +236,9 @@ where
         .map(str::to_string);
     // Check this before `prepare_request`, which adds the name of this proxy.
     let is_loop = headers::via_has(request.headers(), &state.via_name);
+    // Read the trace context of the client before `prepare_request` removes it.
+    let parent = state.telemetry.extract(request.headers());
+    let mut trace_id = Telemetry::trace_id(&parent);
     let prepared = prepare_request(&mut request, &state.upstream, client_ip, &state.via_name);
     // Do this after `prepare_request`. A `Connection` header from the client
     // can name `X-Request-Id`, and then `prepare_request` removes it.
@@ -230,13 +262,23 @@ where
         }
         Some(_) => {
             let response = match prepared {
-                Ok(()) => match forward(&state, request).await {
-                    Some(response) => {
-                        upstream_status = Some(response.status().as_u16());
-                        response
+                Ok(()) => {
+                    let span = state.telemetry.start_upstream_span(
+                        &parent,
+                        method.as_str(),
+                        &state.upstream,
+                    );
+                    trace_id = Telemetry::trace_id(&span);
+                    match forward(&state, request, started, span).await {
+                        Ok(response) => {
+                            upstream_status = Some(response.status().as_u16());
+                            response
+                        }
+                        Err(UpstreamFailure::Error) => bad_gateway(),
+                        Err(UpstreamFailure::Timeout) => gateway_timeout(),
+                        Err(UpstreamFailure::ClientTimeout) => empty(StatusCode::REQUEST_TIMEOUT),
                     }
-                    None => bad_gateway(),
-                },
+                }
                 Err(err) => {
                     warn!(%err, "cannot make the upstream URI");
                     bad_gateway()
@@ -254,6 +296,7 @@ where
         decision,
         status: response.status().as_u16(),
         upstream_status,
+        trace_id: trace_id.as_deref(),
         latency_ms: started.elapsed().as_millis() as u64,
     });
     response
@@ -316,24 +359,81 @@ fn prepare_request<B>(
     Ok(())
 }
 
+/// Why the proxy has no response from the upstream.
+enum UpstreamFailure {
+    /// The connection or the request failed.
+    Error,
+    /// The upstream did not send a response head within `timeouts.upstream`.
+    Timeout,
+    /// The client did not send the request body within `timeouts.client`.
+    ClientTimeout,
+}
+
 /// Send the prepared `request` to the upstream and return the response, with
 /// the hop-by-hop headers removed. Stream the body of the response.
-/// If the upstream fails, log the error and return `None`.
-async fn forward<B>(state: &AppState<B>, request: Request<B>) -> Option<Response<Body>>
+///
+/// `span` is the context that has the span of this request. Set `traceparent`
+/// and `tracestate` from it, and end it when the response head arrives or the
+/// request fails. `started` is the time that the proxy began to handle the
+/// request.
+///
+/// Wait at most `timeouts.upstream` for the response head. The time includes
+/// the connection and the sending of the request. It does not include the body
+/// of the response. The client must also send the request body before
+/// `started + timeouts.client`. If something fails, log it, count a timeout,
+/// and return the reason.
+async fn forward<B>(
+    state: &AppState<B>,
+    request: Request<B>,
+    started: Instant,
+    span: Context,
+) -> Result<Response<Body>, UpstreamFailure>
 where
     B: RequestBody + Send + Unpin + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn Error + Send + Sync>>,
 {
-    match state.client.request(request).await {
-        Ok(response) => {
+    let telemetry = &state.telemetry;
+    let (mut parts, body) = request.into_parts();
+    telemetry.inject(&span, &mut parts.headers);
+    let body = DeadlineBody::new(
+        body,
+        tokio::time::Instant::from_std(started + state.timeouts.client),
+    );
+    let client_expired = body.expired_flag();
+    let request = Request::from_parts(parts, body);
+
+    let result = timeout(state.timeouts.upstream, state.client.request(request)).await;
+    // The client is slow: the failure is not the fault of the upstream.
+    if client_expired.load(Ordering::SeqCst) {
+        warn!(
+            timeout_secs = state.timeouts.client.as_secs(),
+            "the client did not send the request body in time"
+        );
+        telemetry.record_timeout(TimeoutKind::ClientBody);
+        telemetry.end_span(&span, SpanOutcome::ClientTimeout);
+        return Err(UpstreamFailure::ClientTimeout);
+    }
+    match result {
+        Ok(Ok(response)) => {
+            telemetry.end_span(&span, SpanOutcome::Response(response.status().as_u16()));
             let (mut parts, body) = response.into_parts();
             headers::remove_hop_by_hop(&mut parts.headers);
-            Some(Response::from_parts(parts, body.boxed_unsync()))
+            Ok(Response::from_parts(parts, body.boxed_unsync()))
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             warn!(%err, "request to the upstream failed");
-            None
+            telemetry.end_span(&span, SpanOutcome::Failed);
+            Err(UpstreamFailure::Error)
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = state.timeouts.upstream.as_secs(),
+                "the upstream did not answer in time"
+            );
+            telemetry.record_timeout(TimeoutKind::Upstream);
+            telemetry.end_span(&span, SpanOutcome::UpstreamTimeout);
+            Err(UpstreamFailure::Timeout)
         }
     }
 }
@@ -346,6 +446,17 @@ fn empty(status: StatusCode) -> Response<Body> {
         .boxed_unsync();
     let mut response = Response::new(body);
     *response.status_mut() = status;
+    response
+}
+
+/// The answer when the upstream does not send a response in time.
+/// The body has no detail. The detail is in the log.
+fn gateway_timeout() -> Response<Body> {
+    let body = Full::new(Bytes::from_static(b"Gateway Timeout"))
+        .map_err(|never| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::GATEWAY_TIMEOUT;
     response
 }
 
@@ -370,10 +481,14 @@ mod tests {
 
     const PAYMENT_AGENT: &str = "spiffe://acme/prod/payment-agent";
 
-    /// The policy for the tests: `payment-agent` may `GET /path`.
+    fn timeouts(client: Duration, upstream: Duration) -> Timeouts {
+        Timeouts { client, upstream }
+    }
+
+    /// The policy for the tests: `payment-agent` may `GET` and `POST` `/path`.
     fn policies() -> Policies {
         let yaml = format!(
-            "policies:\n- identity: \"{PAYMENT_AGENT}\"\n  allow:\n  - method: GET\n    path: \"/path\"\n"
+            "policies:\n- identity: \"{PAYMENT_AGENT}\"\n  allow:\n  - method: GET\n    path: \"/path\"\n  - method: POST\n    path: \"/path\"\n"
         );
         serde_saphyr::from_str(&yaml).unwrap()
     }
@@ -390,7 +505,12 @@ mod tests {
         headers: &[(&str, &str)],
     ) -> Response<Body> {
         let identity = identity.map(|id| id.parse::<Identity>().unwrap());
-        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM, policies()));
+        let state = Arc::new(AppState::<Full<Bytes>>::new(
+            BAD_UPSTREAM,
+            policies(),
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            Arc::new(Telemetry::without_export()),
+        ));
         let mut request = Request::builder().uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -443,7 +563,12 @@ mod tests {
 
     #[tokio::test]
     async fn handle_returns_508_for_a_request_that_has_the_name_of_the_proxy_in_via() {
-        let state = Arc::new(AppState::<Full<Bytes>>::new(BAD_UPSTREAM, policies()));
+        let state = Arc::new(AppState::<Full<Bytes>>::new(
+            BAD_UPSTREAM,
+            policies(),
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            Arc::new(Telemetry::without_export()),
+        ));
         let via = format!("1.1 other, 1.1 {}", state.via_name);
         let request = Request::builder()
             .uri("/path")
@@ -487,5 +612,326 @@ mod tests {
         let response = call(&[]).await;
 
         assert_eq!(response.headers()["x-request-id"].len(), 36);
+    }
+
+    // --- Spans, trace context and timeouts ---
+
+    use opentelemetry::trace::Status;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+    const PARENT_SPAN_ID: &str = "b7ad6b7169203331";
+
+    /// Telemetry that keeps spans and metrics in memory.
+    struct Observed {
+        telemetry: Arc<Telemetry>,
+        spans: InMemorySpanExporter,
+        metrics: InMemoryMetricExporter,
+        meter_provider: SdkMeterProvider,
+    }
+
+    fn observed() -> Observed {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let meter_provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(metrics.clone())
+            .build();
+        Observed {
+            telemetry: Arc::new(Telemetry::with_providers(
+                tracer_provider,
+                meter_provider.clone(),
+            )),
+            spans,
+            metrics,
+            meter_provider,
+        }
+    }
+
+    impl Observed {
+        /// How many timeouts of `kind` the counter has.
+        fn timeouts(&self, kind: &str) -> u64 {
+            self.meter_provider.force_flush().unwrap();
+            let mut total = 0;
+            for resource in self.metrics.get_finished_metrics().unwrap() {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if metric.name() != "reverse_proxy.timeouts" {
+                            continue;
+                        }
+                        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                            panic!("the counter is not a sum of u64");
+                        };
+                        for point in sum.data_points() {
+                            let has_kind = point.attributes().any(|attribute| {
+                                attribute.key.as_str() == "timeout.kind"
+                                    && attribute.value.as_str() == kind
+                            });
+                            if has_kind {
+                                // The exporter keeps each export. Use the last one.
+                                total = point.value();
+                            }
+                        }
+                    }
+                }
+            }
+            total
+        }
+    }
+
+    /// A web server that answers `200` to one request. It sends the request
+    /// head that it got to the returned channel.
+    async fn answering_upstream() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buffer[..read]);
+            }
+            let _ = sender.send(String::from_utf8_lossy(&head).into_owned());
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        (address, receiver)
+    }
+
+    /// A listener that the kernel accepts connections on, and that never answers.
+    async fn silent_upstream() -> (String, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        (listener.local_addr().unwrap().to_string(), listener)
+    }
+
+    async fn call_handle<B>(state: Arc<AppState<B>>, request: Request<B>) -> Response<Body>
+    where
+        B: RequestBody + Send + Unpin + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        let identity = Some(PAYMENT_AGENT.parse::<Identity>().unwrap());
+        match handle(state, "192.0.2.7".parse().unwrap(), identity, request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
+    fn state_for<B>(upstream: &str, observed: &Observed, timeouts: Timeouts) -> Arc<AppState<B>>
+    where
+        B: RequestBody + Send + Unpin + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        Arc::new(AppState::new(
+            upstream,
+            policies(),
+            timeouts,
+            observed.telemetry.clone(),
+        ))
+    }
+
+    fn get_with(headers: &[(&str, &str)]) -> Request<Full<Bytes>> {
+        let mut request = Request::builder().uri("/path?secret=1");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    /// The value of the `traceparent` header in a request head, if any.
+    fn traceparent_of(head: &str) -> Option<String> {
+        head.lines()
+            .find_map(|line| line.strip_prefix("traceparent: "))
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn handle_keeps_the_trace_id_of_the_client_and_makes_a_span() {
+        let observed = observed();
+        let (upstream, head) = answering_upstream().await;
+        let state = state_for(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+        );
+        let traceparent = format!("00-{TRACE_ID}-{PARENT_SPAN_ID}-01");
+        let request = get_with(&[("traceparent", &traceparent), ("tracestate", "a=b")]);
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = traceparent_of(&head.await.unwrap()).expect("no traceparent for the upstream");
+        // Same trace, new span: the upstream sees the span of the proxy.
+        assert!(sent.starts_with(&format!("00-{TRACE_ID}-")), "got: {sent}");
+        assert!(!sent.contains(PARENT_SPAN_ID), "got: {sent}");
+        let spans = observed.spans.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "upstream request");
+        assert_eq!(span.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(span.parent_span_id.to_string(), PARENT_SPAN_ID);
+        assert!(sent.contains(&span.span_context.span_id().to_string()));
+        let attribute = |name: &str| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == name)
+                .map(|attribute| attribute.value.to_string())
+        };
+        assert_eq!(attribute("http.request.method").as_deref(), Some("GET"));
+        assert_eq!(
+            attribute("http.response.status_code").as_deref(),
+            Some("200")
+        );
+        // The span never has the query or a header.
+        for attribute in &span.attributes {
+            assert!(!attribute.value.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_starts_a_new_trace_when_the_client_sends_none_or_a_bad_one() {
+        for traceparent in [
+            None,
+            Some("not-a-traceparent"),
+            Some("00-00000000000000000000000000000000-0000000000000000-01"),
+        ] {
+            let observed = observed();
+            let (upstream, head) = answering_upstream().await;
+            let state = state_for(
+                &upstream,
+                &observed,
+                timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            );
+            let headers: Vec<(&str, &str)> = traceparent
+                .map(|value| vec![("traceparent", value)])
+                .unwrap_or_default();
+
+            call_handle(state, get_with(&headers)).await;
+
+            let sent = traceparent_of(&head.await.unwrap()).expect("no traceparent");
+            let spans = observed.spans.get_finished_spans().unwrap();
+            let trace_id = spans[0].span_context.trace_id().to_string();
+            assert_eq!(trace_id.len(), 32);
+            assert_ne!(trace_id, "0".repeat(32));
+            assert!(sent.starts_with(&format!("00-{trace_id}-")), "got: {sent}");
+            assert!(
+                !spans[0]
+                    .parent_span_id
+                    .to_string()
+                    .chars()
+                    .any(|c| c != '0')
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_returns_504_and_counts_a_timeout_when_the_upstream_is_silent() {
+        let observed = observed();
+        let (upstream, _listener) = silent_upstream().await;
+        let state = state_for(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_millis(100)),
+        );
+
+        let response = call_handle(state, get_with(&[])).await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(observed.timeouts("upstream"), 1);
+        assert_eq!(observed.timeouts("client_body"), 0);
+        let spans = observed.spans.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(matches!(spans[0].status, Status::Error { .. }));
+        assert!(
+            spans[0]
+                .attributes
+                .iter()
+                .any(|a| a.key.as_str() == "error.type" && a.value.to_string() == "timeout")
+        );
+    }
+
+    /// A request body that never sends a frame.
+    struct StalledBody;
+
+    impl hyper::body::Body for StalledBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_returns_408_and_counts_a_timeout_when_the_client_body_is_too_slow() {
+        let observed = observed();
+        let (upstream, _listener) = silent_upstream().await;
+        let state = state_for::<StalledBody>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_millis(100), Duration::from_secs(5)),
+        );
+        // `hyper` does not send the body of a `GET` request, so use `POST`.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/path")
+            .body(StalledBody)
+            .unwrap();
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(observed.timeouts("client_body"), 1);
+        assert_eq!(observed.timeouts("upstream"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_slow_request_head_gives_a_hyper_timeout_error() {
+        // The same builder settings as `serve`. `spawn_connection` counts the
+        // error only if it is a `hyper::Error` with `is_timeout`.
+        let mut builder = Builder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_millis(100));
+        let (mut client, server) = tokio::io::duplex(1024);
+        let service = service_fn(|_request: Request<hyper::body::Incoming>| async {
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+        });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+
+        let result = builder
+            .serve_connection(TokioIo::new(server), service)
+            .await;
+
+        let err = result.expect_err("the connection must fail");
+        assert!(
+            err.downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_timeout),
+            "got: {err:?}"
+        );
     }
 }

@@ -30,6 +30,9 @@ pub enum Error {
     /// The watcher for the CA bundle file cannot start.
     #[error("cannot watch the client CA file: {0}")]
     Watch(#[from] notify::Error),
+    /// The telemetry cannot be set up, for example the OTLP endpoint is not valid.
+    #[error("telemetry error: {0}")]
+    Telemetry(String),
     /// The policy file cannot be read or is not valid.
     #[error("policy error: {0}")]
     Policy(#[from] PolicyError),
