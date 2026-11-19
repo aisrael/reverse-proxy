@@ -112,6 +112,7 @@ The ADRs in `docs/adrs/` give the reason for each decision.
 - [ADR 004](docs/adrs/004-timeouts-and-telemetry.md): the proxy has timeouts for the client and the upstream, and it exports OpenTelemetry spans and metrics.
 - [ADR 005](docs/adrs/005-body-size-limits-and-streaming.md): the proxy limits the request and response bodies, and it streams them without buffering.
 - [ADR 006](docs/adrs/006-log-client-certificate-fields.md): the proxy writes the fields of the client certificate to the audit event, and does not use them for a decision.
+- [ADR 007](docs/adrs/007-no-retries.md): the proxy does not retry a request that it sent to the upstream, and the client gets the failure at once.
 
 ## Configuration
 
