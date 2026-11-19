@@ -44,6 +44,53 @@ sequenceDiagram
     Note over P: Write the audit event (STDOUT)
 ```
 
+## TLS and identity
+
+The proxy checks the client certificate in two places. The TLS layer (`rustls`,
+in the handshake) decides if the certificate is trusted. The application
+(`src/identity.rs`, after the handshake) decides who the client is.
+
+**TLS layer (`rustls`).** The proxy requires a client certificate. It uses
+`WebPkiClientVerifier` with the CAs in `PROXY_CLIENT_CA`. The handshake fails,
+and the client never sends an HTTP request, if:
+
+- the client sends no certificate;
+- the chain does not end in a CA of the bundle (an untrusted chain), or the
+  certificate has a signature that is not valid;
+- the certificate is expired, or not valid yet (NotBefore and NotAfter);
+- the certificate cannot be used for a client.
+
+The proxy does not check if a certificate is revoked (no CRL and no OCSP). To
+stop a client, remove its CA from the bundle (see "Configuration"), or remove
+the identity from the policy.
+
+**Application.** After the handshake, the proxy reads the certificate of the
+client, once for each connection. The identity is the SPIFFE ID in the URI SAN.
+The certificate must have exactly one URI SAN, and it must be a valid SPIFFE ID:
+the `spiffe://` scheme, a trust domain, a path, and no user info, port, query
+or fragment. If not, every request on that connection gets `401`. The
+handshake has already worked, so the proxy can write an audit event for it.
+
+| Case                                      | Where it fails | Result            |
+| ----------------------------------------- | -------------- | ----------------- |
+| No client certificate                     | TLS layer      | handshake fails   |
+| Untrusted chain or CA                     | TLS layer      | handshake fails   |
+| Expired or not valid yet                  | TLS layer      | handshake fails   |
+| No URI SAN                                | Application    | `401`             |
+| More than one URI SAN                     | Application    | `401`             |
+| URI SAN is not a valid SPIFFE ID          | Application    | `401`             |
+| Valid identity that the policy denies     | Application    | `403`             |
+
+The proxy uses the SPIFFE ID only. It does not read the subject, the issuer, the
+serial number, the dates or the DNS SANs of the client certificate, and the
+audit event does not have them. The audit event has the identity. It never
+has the certificate. The proxy does not compare the trust domain of the
+identity to a list. The policy file decides which identities are allowed.
+
+A certificate is checked in the handshake only. A connection that is open keeps
+working after its certificate expires, or after the CA is removed from the
+bundle. See `docs/adrs/003-reload-the-client-ca-bundle.md`.
+
 ## Architectural Decisions
 
 The ADRs in `docs/adrs/` give the reason for each decision.
