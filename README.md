@@ -17,6 +17,8 @@ set must not be empty.
 | `PROXY_POLICY_FILE` | none (required) | `proxy` | The path of the policy file (YAML). See `policies.yaml`. |
 | `PROXY_CLIENT_TIMEOUT_SECS` | `10` | `proxy` | How long the client has to send the request head, and then the request body, in seconds (a whole number, more than 0). After that, the client gets `408` (or the connection closes). |
 | `PROXY_UPSTREAM_TIMEOUT_SECS` | `10` | `proxy` | How long the proxy waits for the response head from the upstream, in seconds (a whole number, more than 0). After that, the client gets `504`. |
+| `PROXY_MAX_REQUEST_BODY_BYTES` | `1048576` (1 MiB) | `proxy` | The largest request body, in bytes (a whole number). `0` means no limit. A larger body gets `413`. |
+| `PROXY_MAX_RESPONSE_BODY_BYTES` | `1048576` (1 MiB) | `proxy` | The largest response body, in bytes (a whole number). `0` means no limit. See "Body size and streaming". |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | `proxy` | The OTLP/HTTP endpoint for spans and metrics (for example `http://localhost:4318`). The proxy does not export if it is not set. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` set one signal only. |
 | `OTEL_SERVICE_NAME` | `reverse-proxy` | `proxy` | The service name in the spans and metrics. |
 | `RUST_LOG`       | `info`           | both     | The log level of the logs on STDERR, for example `debug`. It does not change the audit events. |
@@ -24,7 +26,8 @@ set must not be empty.
 The `proxy` mode stops at start, with exit code 1, if `PROXY_TLS_CERT`,
 `PROXY_TLS_KEY`, `PROXY_CLIENT_CA` or `PROXY_POLICY_FILE` is not set, if a
 file cannot be read or is not valid, if `PROXY_CLIENT_TIMEOUT_SECS` or
-`PROXY_UPSTREAM_TIMEOUT_SECS` is not a whole number of seconds, more than 0, or if `SERVER_ADDR` is the same text as
+`PROXY_UPSTREAM_TIMEOUT_SECS` is not a whole number of seconds, more than 0, if `PROXY_MAX_REQUEST_BODY_BYTES` or
+`PROXY_MAX_RESPONSE_BODY_BYTES` is not a whole number of bytes, or if `SERVER_ADDR` is the same text as
 `PROXY_ADDR`.
 The `server` mode does not use the TLS variables.
 
@@ -67,6 +70,8 @@ upstream, in these cases:
 | `403`  | The policy does not allow this identity to send this request.   |
 | `508`  | The request came back to this proxy (a loop). See "Headers".    |
 | `408`  | The client does not send the request body within `PROXY_CLIENT_TIMEOUT_SECS`. The body is empty. |
+| `413`  | The request body is larger than `PROXY_MAX_REQUEST_BODY_BYTES`. The body is empty. |
+| `502`  | The response body is larger than `PROXY_MAX_RESPONSE_BODY_BYTES`, and the upstream said so in its head (`Content-Length`). The body is `Bad Gateway`. |
 | `502`  | The proxy cannot connect to the upstream, or the upstream fails before it sends a response head. The body is `Bad Gateway`. |
 | `504`  | The upstream sends no response head within `PROXY_UPSTREAM_TIMEOUT_SECS`. The body is `Gateway Timeout`. |
 
@@ -88,6 +93,33 @@ Timeouts:
   that a connection is idle between requests.
 
 Each timeout adds 1 to a counter. See "OpenTelemetry".
+
+Body size and streaming:
+
+- **Streaming:** the proxy never reads a whole body into memory. It sends each
+  chunk of the request body to the upstream, and each chunk of the response
+  body to the client, as it arrives. A slow reader slows the sender.
+- **Request limit:** if the request has a `Content-Length` above the limit, the
+  proxy answers `413` and does not connect to the upstream. Without a length
+  (a chunked body), the proxy counts the bytes while it streams. When the count
+  passes the limit, the proxy stops the request to the upstream, closes that
+  connection, and answers `413`. The upstream can have the first part of the
+  body.
+- **Response limit:** if the response head has a `Content-Length` above the
+  limit, the proxy sends nothing of the body and answers `502`. Without a
+  length, the proxy counts the bytes while it streams. When the count passes
+  the limit, the proxy closes the upstream connection and the response to the
+  client stops before its end. The client already has the status and the
+  headers, so the status cannot change, and the audit event has the status of
+  the head.
+- **What the count includes:** the bytes of the body as the proxy sees them,
+  without the headers and without the trailers. The proxy does not decode
+  compressed bodies.
+- **`GET` body:** `hyper` does not send the body of a `GET` request to the
+  upstream, so the limit does not apply to it.
+- **Race:** if the upstream sends its response before it reads the whole
+  request body, the client gets that response and not `413`.
+- A limit of `0` turns the limit off for that direction.
 
 The proxy does not decode `%` sequences in the path. See
 `docs/adrs/001-no-percent-decoding-in-path-policy.md`.

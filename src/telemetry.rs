@@ -73,6 +73,8 @@ pub enum SpanOutcome {
     UpstreamTimeout,
     /// The client sent the request body too slowly.
     ClientTimeout,
+    /// A body is larger than the limit.
+    BodyTooLarge,
 }
 
 /// The telemetry of the proxy. Share it as `Arc<Telemetry>`.
@@ -232,6 +234,10 @@ impl Telemetry {
             SpanOutcome::UpstreamTimeout => {
                 span.set_attribute(KeyValue::new("error.type", "timeout"));
                 span.set_status(Status::error("the upstream did not answer in time"));
+            }
+            SpanOutcome::BodyTooLarge => {
+                span.set_attribute(KeyValue::new("error.type", "body_too_large"));
+                span.set_status(Status::error("a body is larger than the limit"));
             }
             SpanOutcome::ClientTimeout => {
                 span.set_attribute(KeyValue::new("error.type", "client_timeout"));

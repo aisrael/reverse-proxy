@@ -38,6 +38,17 @@ export PROXY_CLIENT_TIMEOUT_SECS="10"
 # The default is `10`.
 export PROXY_UPSTREAM_TIMEOUT_SECS="10"
 
+# The largest request body that the proxy accepts from a client, in bytes. It
+# must be a whole number. `0` means no limit. A larger body gets `413`. The
+# default is `1048576` (1 MiB).
+export PROXY_MAX_REQUEST_BODY_BYTES="1048576"
+
+# The largest response body that the proxy accepts from the upstream, in bytes.
+# It must be a whole number. `0` means no limit. A larger body gets `502`, or
+# the response stops if the proxy already sent the head. The default is
+# `1048576` (1 MiB).
+export PROXY_MAX_RESPONSE_BODY_BYTES="1048576"
+
 # Where the proxy sends spans and metrics (OTLP over HTTP). If you do not set
 # it, the proxy exports nothing. Example for a local collector:
 # export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"

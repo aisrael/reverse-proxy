@@ -2,6 +2,7 @@
 
 use crate::deadline::DeadlineBody;
 use crate::headers;
+use crate::limit::LimitBody;
 use crate::policy::Policies;
 use crate::telemetry::Telemetry;
 use hyper::body::Body;
@@ -24,9 +25,18 @@ pub struct Timeouts {
     pub upstream: Duration,
 }
 
+/// The largest body that the proxy accepts, in bytes. `None` means no limit.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// The largest request body from the client.
+    pub request: Option<u64>,
+    /// The largest response body from the upstream.
+    pub response: Option<u64>,
+}
+
 /// The client that sends requests to the upstream. `B` is the type of the
 /// request body that the proxy got from the client.
-pub type UpstreamClient<B> = Client<HttpConnector, DeadlineBody<B>>;
+pub type UpstreamClient<B> = Client<HttpConnector, DeadlineBody<LimitBody<B>>>;
 
 /// The state that all requests share. Share it as `Arc<AppState>`.
 ///
@@ -44,6 +54,8 @@ pub struct AppState<B = Incoming> {
     pub via_name: String,
     /// How long to wait for the client and for the upstream.
     pub timeouts: Timeouts,
+    /// The largest request body and response body.
+    pub limits: Limits,
     /// The spans and the counter of timeouts.
     pub telemetry: Arc<Telemetry>,
 }
@@ -59,6 +71,7 @@ where
         upstream: &str,
         policies: Policies,
         timeouts: Timeouts,
+        limits: Limits,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         Self {
@@ -67,6 +80,7 @@ where
             policies,
             via_name: headers::new_via_name(),
             timeouts,
+            limits,
             telemetry,
         }
     }

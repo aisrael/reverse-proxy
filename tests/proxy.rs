@@ -464,9 +464,18 @@ async fn forwards_the_request_body() {
 
 #[tokio::test]
 #[serial]
-async fn forwards_a_large_body_both_ways() {
+async fn forwards_a_large_body_both_ways_when_the_limits_are_off() {
     let _server = Program::start("server", SERVER_ADDR).await;
-    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let _proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[
+            ("PROXY_MAX_REQUEST_BODY_BYTES", "0"),
+            ("PROXY_MAX_RESPONSE_BODY_BYTES", "0"),
+        ],
+    )
+    .await;
     // 8 MiB, with a pattern that shows a lost or a reordered chunk.
     let sent: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
 
@@ -1364,4 +1373,158 @@ async fn closes_the_connection_of_a_client_that_sends_the_request_head_too_slowl
 
     assert!(result.is_ok(), "the proxy kept the connection open");
     assert!(!String::from_utf8_lossy(&reply).contains("200 OK"));
+}
+
+/// The limit for the body tests, in bytes.
+const BODY_LIMIT: usize = 1024;
+
+#[tokio::test]
+#[serial]
+async fn answers_413_for_a_request_body_above_the_limit() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[
+            ("PROXY_MAX_REQUEST_BODY_BYTES", "1024"),
+            ("PROXY_MAX_RESPONSE_BODY_BYTES", "0"),
+        ],
+    )
+    .await;
+
+    let (at_limit, _, echoed) = send(
+        &client(),
+        Method::POST,
+        "/echo",
+        &[],
+        vec![b'x'; BODY_LIMIT],
+    )
+    .await;
+    let (too_large, _, _) = send(
+        &client(),
+        Method::POST,
+        "/echo",
+        &[],
+        vec![b'x'; BODY_LIMIT + 1],
+    )
+    .await;
+
+    assert_eq!(at_limit, StatusCode::OK);
+    assert_eq!(echoed.len(), BODY_LIMIT);
+    assert_eq!(too_large, StatusCode::PAYLOAD_TOO_LARGE);
+    let events = proxy.audit_events();
+    assert_eq!(events[1]["status"], 413);
+    assert!(events[1].get("upstream_status").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn answers_413_when_a_streamed_request_body_grows_above_the_limit() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[("PROXY_MAX_REQUEST_BODY_BYTES", "1024")],
+    )
+    .await;
+    let mut stream = connect(&client().connector).await;
+    // A chunked body has no length. Two chunks of 600 bytes (0x258) are 1200 bytes.
+    let chunk = "x".repeat(600);
+    let request = format!(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n258\r\n{chunk}\r\n258\r\n{chunk}\r\n0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+        .await
+        .expect("the proxy did not answer in time")
+        .ok();
+
+    assert!(
+        String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 413"),
+        "got: {}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(proxy.audit_events()[0]["status"], 413);
+}
+
+#[tokio::test]
+#[serial]
+async fn answers_502_for_a_response_body_above_the_limit() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let proxy = Program::start_with(
+        "proxy",
+        PROXY_ADDR,
+        CA_PATH,
+        &[
+            ("PROXY_MAX_REQUEST_BODY_BYTES", "0"),
+            ("PROXY_MAX_RESPONSE_BODY_BYTES", "1024"),
+        ],
+    )
+    .await;
+
+    // The `server` mode sends the request body back, so its size is the size
+    // of the response body.
+    let (at_limit, _, echoed) = send(
+        &client(),
+        Method::POST,
+        "/echo",
+        &[],
+        vec![b'x'; BODY_LIMIT],
+    )
+    .await;
+    let (too_large, _, body) = send(
+        &client(),
+        Method::POST,
+        "/echo",
+        &[],
+        vec![b'x'; BODY_LIMIT + 1],
+    )
+    .await;
+
+    assert_eq!(at_limit, StatusCode::OK);
+    assert_eq!(echoed.len(), BODY_LIMIT);
+    assert_eq!(too_large, StatusCode::BAD_GATEWAY);
+    assert_eq!(&body[..], b"Bad Gateway");
+    let events = proxy.audit_events();
+    assert_eq!(events[1]["status"], 502);
+    assert_eq!(events[1]["upstream_status"], 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn limits_the_request_body_to_1_mib_by_default() {
+    let _server = Program::start("server", SERVER_ADDR).await;
+    let _proxy = Program::start("proxy", PROXY_ADDR).await;
+    let mib = 1024 * 1024;
+
+    let (at_limit, _, _) = send(&client(), Method::POST, "/echo", &[], vec![b'x'; mib]).await;
+    let (too_large, _, _) = send(&client(), Method::POST, "/echo", &[], vec![b'x'; mib + 1]).await;
+
+    assert_eq!(at_limit, StatusCode::OK);
+    assert_eq!(too_large, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+#[serial]
+async fn exits_with_code_1_when_a_body_limit_is_not_a_number_of_bytes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_reverse-proxy"))
+        .arg("proxy")
+        .env("PROXY_MAX_RESPONSE_BODY_BYTES", "1MiB")
+        .env("PROXY_TLS_CERT", CERT_PATH)
+        .env("PROXY_TLS_KEY", KEY_PATH)
+        .env("PROXY_CLIENT_CA", CA_PATH)
+        .env("PROXY_POLICY_FILE", POLICY_PATH)
+        .output()
+        .expect("failed to run the program");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("PROXY_MAX_RESPONSE_BODY_BYTES"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

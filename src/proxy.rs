@@ -9,9 +9,12 @@ use crate::audit::Reason;
 use crate::deadline::DeadlineBody;
 use crate::headers;
 use crate::identity::Identity;
+use crate::limit::BodyTooLarge;
+use crate::limit::LimitBody;
 use crate::policy;
 use crate::policy::Policies;
 use crate::state::AppState;
+use crate::state::Limits;
 use crate::state::Timeouts;
 use crate::telemetry::SpanOutcome;
 use crate::telemetry::Telemetry;
@@ -63,17 +66,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The type of every response body. The answer from the upstream and our own
 /// error answer have different body types, so both are boxed.
-type Body = UnsyncBoxBody<Bytes, hyper::Error>;
+type Body = UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>;
 
 /// Accept connections on `listener` until `shutdown` is cancelled.
 /// Every connection uses TLS: `acceptor` does the handshake.
 /// The requests go to the upstream at `upstream` (a `host:port` address).
 /// `policies` say which client identity may send which requests.
 /// `timeouts` say how long to wait for the client and for the upstream.
+/// `limits` say how large a request body and a response body can be.
 /// `telemetry` has the spans and the counter of timeouts.
 ///
 /// After that, stop accepting and wait for open connections to finish.
 /// Stop waiting after `SHUTDOWN_TIMEOUT`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     shutdown: CancellationToken,
@@ -81,9 +86,12 @@ pub async fn serve(
     upstream: &str,
     policies: Policies,
     timeouts: Timeouts,
+    limits: Limits,
     telemetry: Arc<Telemetry>,
 ) {
-    let state = Arc::new(AppState::new(upstream, policies, timeouts, telemetry));
+    let state = Arc::new(AppState::new(
+        upstream, policies, timeouts, limits, telemetry,
+    ));
     info!(upstream = %state.upstream, "sending requests to the upstream");
     let mut builder = Builder::new(TokioExecutor::new());
     // HTTP/1: close a connection that does not send the request head in time.
@@ -277,6 +285,15 @@ where
                         Err(UpstreamFailure::Error) => bad_gateway(),
                         Err(UpstreamFailure::Timeout) => gateway_timeout(),
                         Err(UpstreamFailure::ClientTimeout) => empty(StatusCode::REQUEST_TIMEOUT),
+                        Err(UpstreamFailure::RequestTooLarge) => {
+                            empty(StatusCode::PAYLOAD_TOO_LARGE)
+                        }
+                        Err(UpstreamFailure::ResponseTooLarge {
+                            upstream_status: status,
+                        }) => {
+                            upstream_status = Some(status);
+                            bad_gateway()
+                        }
                     }
                 }
                 Err(err) => {
@@ -367,6 +384,11 @@ enum UpstreamFailure {
     Timeout,
     /// The client did not send the request body within `timeouts.client`.
     ClientTimeout,
+    /// The request body is larger than `limits.request`.
+    RequestTooLarge,
+    /// The response body is larger than `limits.response`. The proxy knew this
+    /// from the head, so it sent nothing to the client.
+    ResponseTooLarge { upstream_status: u16 },
 }
 
 /// Send the prepared `request` to the upstream and return the response, with
@@ -395,7 +417,17 @@ where
 {
     let telemetry = &state.telemetry;
     let (mut parts, body) = request.into_parts();
+    // A body with a length that is too large: do not connect to the upstream.
+    if let Some(limit) = state.limits.request
+        && body.size_hint().lower() > limit
+    {
+        warn!(limit, "the request body is larger than the limit");
+        telemetry.end_span(&span, SpanOutcome::BodyTooLarge);
+        return Err(UpstreamFailure::RequestTooLarge);
+    }
     telemetry.inject(&span, &mut parts.headers);
+    let body = LimitBody::new(body, state.limits.request);
+    let request_too_large = body.exceeded_flag();
     let body = DeadlineBody::new(
         body,
         tokio::time::Instant::from_std(started + state.timeouts.client),
@@ -414,12 +446,48 @@ where
         telemetry.end_span(&span, SpanOutcome::ClientTimeout);
         return Err(UpstreamFailure::ClientTimeout);
     }
+    // The body was too large: the request to the upstream stopped, and the
+    // client gets `413`.
+    if request_too_large.load(Ordering::SeqCst) {
+        warn!(
+            limit = state.limits.request,
+            "the request body is larger than the limit"
+        );
+        telemetry.end_span(&span, SpanOutcome::BodyTooLarge);
+        return Err(UpstreamFailure::RequestTooLarge);
+    }
     match result {
         Ok(Ok(response)) => {
-            telemetry.end_span(&span, SpanOutcome::Response(response.status().as_u16()));
+            let status = response.status().as_u16();
             let (mut parts, body) = response.into_parts();
+            // A body with a length that is too large: send nothing of it. The
+            // proxy drops the response, and this closes the upstream connection.
+            if let Some(limit) = state.limits.response
+                && body.size_hint().lower() > limit
+            {
+                warn!(limit, "the response body is larger than the limit");
+                telemetry.end_span(&span, SpanOutcome::BodyTooLarge);
+                return Err(UpstreamFailure::ResponseTooLarge {
+                    upstream_status: status,
+                });
+            }
+            telemetry.end_span(&span, SpanOutcome::Response(status));
             headers::remove_hop_by_hop(&mut parts.headers);
-            Ok(Response::from_parts(parts, body.boxed_unsync()))
+            // The proxy already has the head, so a body that grows too large
+            // can only stop the stream. hyper then closes the connection to
+            // the upstream, and the client sees an incomplete response.
+            let body = LimitBody::new(body, state.limits.response)
+                .map_err(|err| {
+                    if let Some(too_large) = err.downcast_ref::<BodyTooLarge>() {
+                        warn!(
+                            limit = too_large.limit,
+                            "the response body is larger than the limit"
+                        );
+                    }
+                    err
+                })
+                .boxed_unsync();
+            Ok(Response::from_parts(parts, body))
         }
         Ok(Err(err)) => {
             warn!(%err, "request to the upstream failed");
@@ -485,6 +553,13 @@ mod tests {
         Timeouts { client, upstream }
     }
 
+    fn no_limits() -> Limits {
+        Limits {
+            request: None,
+            response: None,
+        }
+    }
+
     /// The policy for the tests: `payment-agent` may `GET` and `POST` `/path`.
     fn policies() -> Policies {
         let yaml = format!(
@@ -509,6 +584,7 @@ mod tests {
             BAD_UPSTREAM,
             policies(),
             timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            no_limits(),
             Arc::new(Telemetry::without_export()),
         ));
         let mut request = Request::builder().uri(uri);
@@ -567,6 +643,7 @@ mod tests {
             BAD_UPSTREAM,
             policies(),
             timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            no_limits(),
             Arc::new(Telemetry::without_export()),
         ));
         let via = format!("1.1 other, 1.1 {}", state.via_name);
@@ -623,6 +700,7 @@ mod tests {
     use opentelemetry_sdk::metrics::data::MetricData;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use opentelemetry_sdk::trace::SdkTracerProvider;
+    use std::future::Future;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -739,10 +817,25 @@ mod tests {
         B::Data: Send,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        state_with_limits(upstream, observed, timeouts, no_limits())
+    }
+
+    fn state_with_limits<B>(
+        upstream: &str,
+        observed: &Observed,
+        timeouts: Timeouts,
+        limits: Limits,
+    ) -> Arc<AppState<B>>
+    where
+        B: RequestBody + Send + Unpin + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
         Arc::new(AppState::new(
             upstream,
             policies(),
             timeouts,
+            limits,
             observed.telemetry.clone(),
         ))
     }
@@ -903,6 +996,312 @@ mod tests {
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(observed.timeouts("client_body"), 1);
         assert_eq!(observed.timeouts("upstream"), 0);
+    }
+
+    /// The limit in bytes for the body tests.
+    const LIMIT: u64 = 1024;
+
+    fn limits(request: Option<u64>, response: Option<u64>) -> Limits {
+        Limits { request, response }
+    }
+
+    /// A request body of two frames. It has no length, as a chunked body.
+    struct TwoFrames {
+        frames: usize,
+        size: usize,
+    }
+
+    impl hyper::body::Body for TwoFrames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            if self.frames == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            self.frames -= 1;
+            let data = Bytes::from(vec![b'x'; self.size]);
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+        }
+    }
+
+    /// A web server that reads one connection until the client closes it. It
+    /// sends the number of bytes that it read to the returned channel.
+    async fn draining_upstream() -> (String, tokio::sync::oneshot::Receiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut total = 0;
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => total += read,
+                }
+            }
+            let _ = sender.send(total);
+        });
+        (address, receiver)
+    }
+
+    /// A web server that reads the request head, writes `response`, and closes
+    /// the connection.
+    async fn scripted_upstream(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buffer[..read]);
+            }
+            let _ = stream.write_all(&response).await;
+        });
+        address
+    }
+
+    fn post_with<B>(body: B) -> Request<B> {
+        Request::builder()
+            .method("POST")
+            .uri("/path")
+            .body(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_returns_413_for_a_request_with_a_length_above_the_limit() {
+        let observed = observed();
+        let (upstream, listener) = silent_upstream().await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(Some(LIMIT), None),
+        );
+        let request = post_with(Full::new(Bytes::from(vec![b'x'; LIMIT as usize + 1])));
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // The proxy knew the length, so it never connected to the upstream.
+        let accepted = timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "the proxy connected to the upstream");
+    }
+
+    #[tokio::test]
+    async fn handle_forwards_a_request_of_exactly_the_limit() {
+        let observed = observed();
+        let (upstream, _head) = answering_upstream().await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(Some(LIMIT), None),
+        );
+        let request = post_with(Full::new(Bytes::from(vec![b'x'; LIMIT as usize])));
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_returns_413_and_closes_the_upstream_when_a_streamed_request_grows_too_large() {
+        let observed = observed();
+        let (upstream, drained) = draining_upstream().await;
+        let state = state_with_limits::<TwoFrames>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(Some(LIMIT), None),
+        );
+        // 2 frames of 600 bytes: 1200 bytes, and no length.
+        let request = post_with(TwoFrames {
+            frames: 2,
+            size: 600,
+        });
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // The upstream connection closes. The upstream did not get the whole body.
+        let total = timeout(Duration::from_secs(2), drained)
+            .await
+            .expect("the upstream connection stayed open")
+            .unwrap();
+        assert!(total < 1200, "the upstream got {total} bytes");
+    }
+
+    #[tokio::test]
+    async fn handle_forwards_a_large_request_when_the_limit_is_off() {
+        let observed = observed();
+        let (upstream, _head) = answering_upstream().await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(None, None),
+        );
+        let request = post_with(Full::new(Bytes::from(vec![b'x'; 4 * LIMIT as usize])));
+
+        let response = call_handle(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_returns_502_for_a_response_with_a_length_above_the_limit() {
+        let observed = observed();
+        let upstream = scripted_upstream(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                LIMIT + 1
+            )
+            .into_bytes(),
+        )
+        .await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(None, Some(LIMIT)),
+        );
+
+        let response = call_handle(state, get_with(&[])).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn handle_stops_a_streamed_response_that_grows_too_large() {
+        let observed = observed();
+        // A chunked response of 2 chunks of 600 bytes (0x258): 1200 bytes.
+        let chunk = "x".repeat(600);
+        let upstream = scripted_upstream(
+            format!(
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n258\r\n{chunk}\r\n258\r\n{chunk}\r\n0\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(None, Some(LIMIT)),
+        );
+
+        let response = call_handle(state, get_with(&[])).await;
+
+        // The head is already sent, so the status stays `200`. The body fails.
+        assert_eq!(response.status(), StatusCode::OK);
+        let err = response.into_body().collect().await.unwrap_err();
+        assert!(err.downcast_ref::<BodyTooLarge>().is_some(), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn handle_forwards_a_response_of_exactly_the_limit() {
+        let observed = observed();
+        let body = "x".repeat(LIMIT as usize);
+        let upstream = scripted_upstream(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {LIMIT}\r\nconnection: close\r\n\r\n{body}"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let state = state_with_limits::<Full<Bytes>>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+            limits(None, Some(LIMIT)),
+        );
+
+        let response = call_handle(state, get_with(&[])).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), LIMIT as usize);
+    }
+
+    /// A request body that sends one frame and then waits for `gate`. It has
+    /// no length.
+    struct GatedBody {
+        sent_first: bool,
+        gate: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl hyper::body::Body for GatedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            if !self.sent_first {
+                self.sent_first = true;
+                let data = Bytes::from_static(b"FIRSTCHUNK");
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))));
+            }
+            match std::pin::Pin::new(&mut self.gate).poll(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_sends_the_request_body_to_the_upstream_while_the_client_still_sends() {
+        let observed = observed();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap().to_string();
+        let (seen_sender, seen_receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !String::from_utf8_lossy(&received).contains("FIRSTCHUNK") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..read]);
+            }
+            let _ = seen_sender.send(());
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let state = state_for::<GatedBody>(
+            &upstream,
+            &observed,
+            timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+        );
+        // The gate stays closed: the client never finishes the body.
+        let (_gate_sender, gate) = tokio::sync::oneshot::channel();
+        let request = post_with(GatedBody {
+            sent_first: false,
+            gate,
+        });
+
+        let call = tokio::spawn(call_handle(state, request));
+
+        timeout(Duration::from_secs(2), seen_receiver)
+            .await
+            .expect("the upstream did not get the first chunk while the body was open")
+            .unwrap();
+        call.abort();
     }
 
     #[tokio::test]

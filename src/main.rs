@@ -4,6 +4,7 @@ mod deadline;
 mod errors;
 mod headers;
 mod identity;
+mod limit;
 mod logging;
 mod policy;
 mod proxy;
@@ -72,6 +73,7 @@ async fn main() -> Result<(), Error> {
                 config.server_addr(),
                 policies,
                 config.timeouts(),
+                config.limits(),
                 telemetry.clone(),
             )
             .await

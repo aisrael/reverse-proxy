@@ -1,5 +1,6 @@
 //! The configuration of the program. All environment variables are read here.
 
+use crate::state::Limits;
 use crate::state::Timeouts;
 use std::env::VarError;
 use std::time::Duration;
@@ -19,6 +20,9 @@ pub enum ConfigError {
     /// The environment variable must be a whole number of seconds, more than 0.
     #[error("environment variable {name} must be a number of seconds, more than 0 (got {value:?})")]
     NotSeconds { name: &'static str, value: String },
+    /// The environment variable must be a whole number of bytes. 0 means no limit.
+    #[error("environment variable {name} must be a whole number of bytes (got {value:?})")]
+    NotBytes { name: &'static str, value: String },
     /// `SERVER_ADDR` and `PROXY_ADDR` are the same address. The proxy would send
     /// every request to itself.
     #[error(
@@ -48,6 +52,10 @@ pub struct Config {
     client_timeout: Duration,
     /// How long the proxy waits for the response head from the upstream.
     upstream_timeout: Duration,
+    /// The largest request body in bytes. 0 means no limit.
+    max_request_body_bytes: u64,
+    /// The largest response body in bytes. 0 means no limit.
+    max_response_body_bytes: u64,
 }
 
 /// The address of the `proxy` mode when `PROXY_ADDR` is not set.
@@ -59,6 +67,26 @@ const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:9000";
 /// The time that the proxy waits for the client, and for the upstream, when
 /// `PROXY_CLIENT_TIMEOUT_SECS` and `PROXY_UPSTREAM_TIMEOUT_SECS` are not set.
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// The size limit of a body when `PROXY_MAX_REQUEST_BODY_BYTES` and
+/// `PROXY_MAX_RESPONSE_BODY_BYTES` are not set: 1 MiB.
+const DEFAULT_MAX_BODY_BYTES: u64 = 1024 * 1024;
+
+/// Read an environment variable that is a number of bytes.
+///
+/// Return `default` if the variable is not set. If the variable is set, it must
+/// be a whole number. 0 is valid and means no limit.
+fn try_read_bytes_from_env_with_default(
+    name: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let Some(value) = try_read_optional_from_env(name)? else {
+        return Ok(default);
+    };
+    value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::NotBytes { name, value })
+}
 
 /// Read an environment variable that is a number of seconds.
 ///
@@ -132,6 +160,14 @@ impl Config {
                 "PROXY_UPSTREAM_TIMEOUT_SECS",
                 DEFAULT_TIMEOUT_SECS,
             )?,
+            max_request_body_bytes: try_read_bytes_from_env_with_default(
+                "PROXY_MAX_REQUEST_BODY_BYTES",
+                DEFAULT_MAX_BODY_BYTES,
+            )?,
+            max_response_body_bytes: try_read_bytes_from_env_with_default(
+                "PROXY_MAX_RESPONSE_BODY_BYTES",
+                DEFAULT_MAX_BODY_BYTES,
+            )?,
         })
     }
 
@@ -150,6 +186,15 @@ impl Config {
         Timeouts {
             client: self.client_timeout,
             upstream: self.upstream_timeout,
+        }
+    }
+
+    /// The size limits of the bodies. A value of 0 in the environment gives
+    /// `None`: no limit.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            request: (self.max_request_body_bytes > 0).then_some(self.max_request_body_bytes),
+            response: (self.max_response_body_bytes > 0).then_some(self.max_response_body_bytes),
         }
     }
 
@@ -220,7 +265,79 @@ mod tests {
             policy_file: None,
             client_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             upstream_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            max_request_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_response_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    #[test]
+    fn limits_are_1_mib_by_default() {
+        let limits = config(None, None).limits();
+
+        assert_eq!(limits.request, Some(1_048_576));
+        assert_eq!(limits.response, Some(1_048_576));
+    }
+
+    #[test]
+    fn a_limit_of_0_means_no_limit() {
+        let mut config = config(None, None);
+        config.max_request_body_bytes = 0;
+        config.max_response_body_bytes = 0;
+
+        let limits = config.limits();
+
+        assert_eq!(limits.request, None);
+        assert_eq!(limits.response, None);
+    }
+
+    #[test]
+    fn bytes_returns_the_default_when_not_set() {
+        let value = try_read_bytes_from_env_with_default("CONFIG_TEST_BYTES_NOT_SET", 7).unwrap();
+
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn bytes_returns_the_value_and_accepts_0() {
+        set("CONFIG_TEST_BYTES_SET", "1024");
+        set("CONFIG_TEST_BYTES_ZERO", "0");
+
+        assert_eq!(
+            try_read_bytes_from_env_with_default("CONFIG_TEST_BYTES_SET", 7).unwrap(),
+            1024
+        );
+        assert_eq!(
+            try_read_bytes_from_env_with_default("CONFIG_TEST_BYTES_ZERO", 7).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bytes_fails_for_text_and_for_numbers_that_are_not_whole() {
+        for (name, value) in [
+            ("CONFIG_TEST_BYTES_TEXT", "big"),
+            ("CONFIG_TEST_BYTES_NEGATIVE", "-1"),
+            ("CONFIG_TEST_BYTES_FRACTION", "1.5"),
+            ("CONFIG_TEST_BYTES_UNIT", "1MiB"),
+        ] {
+            set(name, value);
+
+            let err = try_read_bytes_from_env_with_default(name, 7).unwrap_err();
+
+            assert!(
+                matches!(&err, ConfigError::NotBytes { value: got, .. } if got == value),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_fails_when_empty() {
+        set("CONFIG_TEST_BYTES_EMPTY", "");
+
+        let err = try_read_bytes_from_env_with_default("CONFIG_TEST_BYTES_EMPTY", 7).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Empty(_)), "got: {err}");
     }
 
     #[test]
